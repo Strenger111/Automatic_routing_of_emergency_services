@@ -1,10 +1,53 @@
+# Секреты и пароли
 .env
+.env.example
+.env.template
+*.env
+*.env.local
+
+# IDE
 .idea/
-__pycache__/
-venv/
-.pytest_cache/
-database.py
-project_dump.txt
-export_project.py
-*.pyc
 *.iml
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# Локальные файлы проекта
+database.py
+city_monitor/database.py
+city_monitor/__pycache__/
+city_monitor/instance/
+city_monitor/project_dump.txt
+city_monitor/export_project.py
+
+# Данные (могут быть большими)
+static/data/graph.graphml
+static/data/houses.geojson
+static/data/added_*.geojson
+static/data/config.json
+cache/
+*.graphml
+*.geojson
+
+# Логи и дампы
+*.log
+*.sql
+*.dump
+*.db
+*.db-journal
+dispatcher.db
+city_monitor/instance/*.db
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
