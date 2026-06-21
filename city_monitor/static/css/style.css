@@ -1,0 +1,499 @@
+/* static/css/style.css - полная версия */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+}
+
+/* Навигация */
+.navbar {
+    background: rgba(44, 62, 80, 0.95);
+    backdrop-filter: blur(10px);
+    color: white;
+    padding: 12px 24px;
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+    position: sticky;
+    top: 0;
+    z-index: 1000;
+}
+
+.navbar a {
+    color: white;
+    text-decoration: none;
+    padding: 8px 16px;
+    border-radius: 8px;
+    transition: all 0.3s ease;
+    font-weight: 500;
+}
+
+.navbar a:hover {
+    background: rgba(255,255,255,0.2);
+    transform: translateY(-2px);
+}
+
+.navbar a.active {
+    background: #3498db;
+}
+
+/* Карта */
+#map {
+    height: 100vh;
+    width: 100%;
+}
+
+/* Панели на карте */
+.map-panel {
+    background: rgba(255,255,255,0.95);
+    backdrop-filter: blur(10px);
+    border-radius: 12px;
+    padding: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    border: 1px solid rgba(255,255,255,0.2);
+}
+
+/* Легенда */
+#legend, .legend {
+    background: rgba(255,255,255,0.95);
+    backdrop-filter: blur(10px);
+    padding: 12px;
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    min-width: 160px;
+    max-width: 200px;
+    font-size: 13px;
+}
+
+#legend button, .legend button {
+    background: linear-gradient(135deg, #3498db, #2980b9);
+    border: none;
+    color: white;
+    border-radius: 8px;
+    font-size: 12px;
+    margin-top: 8px;
+    padding: 8px 12px;
+    width: 100%;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+#legend button:hover, .legend button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}
+
+#legend select, .legend select {
+    width: 100%;
+    padding: 6px;
+    border-radius: 8px;
+    border: 1px solid #ddd;
+    margin-bottom: 8px;
+}
+
+/* Панель машин */
+#vehicles-panel, .vehicles-panel {
+    background: rgba(255,255,255,0.95);
+    backdrop-filter: blur(10px);
+    padding: 12px;
+    border-radius: 12px;
+    width: 280px;
+    max-height: 400px;
+    overflow-y: auto;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    font-size: 12px;
+}
+
+#vehicles-panel strong, .vehicles-panel strong {
+    display: block;
+    margin-bottom: 8px;
+    color: #2c3e50;
+}
+
+/* Таблицы */
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+
+.data-table th {
+    background: linear-gradient(135deg, #34495e, #2c3e50);
+    color: white;
+    padding: 12px;
+    text-align: left;
+    font-weight: 600;
+}
+
+.data-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #eee;
+}
+
+.data-table tr:hover {
+    background: #f8f9fa;
+}
+
+.data-table button {
+    background: #3498db;
+    border: none;
+    color: white;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    margin: 2px;
+    font-size: 12px;
+    transition: all 0.2s;
+}
+
+.data-table button:hover {
+    background: #2980b9;
+    transform: scale(1.02);
+}
+
+.data-table button.delete {
+    background: #e74c3c;
+}
+
+.data-table button.delete:hover {
+    background: #c0392b;
+}
+
+.data-table button.warning {
+    background: #f39c12;
+}
+
+/* Карточки */
+.card {
+    background: white;
+    border-radius: 16px;
+    padding: 20px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+}
+
+.card h2 {
+    color: #2c3e50;
+    margin-bottom: 16px;
+    border-left: 4px solid #3498db;
+    padding-left: 12px;
+    font-size: 1.3rem;
+}
+
+.card h3 {
+    color: #34495e;
+    margin: 12px 0 8px 0;
+    font-size: 1.1rem;
+}
+
+/* Статистические блоки */
+.stats-grid {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.stat-card {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 20px;
+    border-radius: 16px;
+    flex: 1;
+    min-width: 140px;
+    text-align: center;
+    transition: transform 0.2s;
+}
+
+.stat-card:hover {
+    transform: translateY(-3px);
+}
+
+.stat-card.orange {
+    background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+}
+
+.stat-card.green {
+    background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+}
+
+.stat-card.blue {
+    background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+}
+
+.stat-number {
+    font-size: 32px;
+    font-weight: bold;
+}
+
+.stat-label {
+    font-size: 12px;
+    opacity: 0.9;
+    margin-top: 8px;
+}
+
+/* Рекомендации */
+.recommendation {
+    background: #e8f5e9;
+    border-left: 4px solid #4caf50;
+    padding: 14px;
+    margin: 12px 0;
+    border-radius: 12px;
+    transition: all 0.2s;
+}
+
+.recommendation:hover {
+    transform: translateX(4px);
+}
+
+.recommendation.warning {
+    background: #fff3e0;
+    border-left-color: #ff9800;
+}
+
+.recommendation.critical {
+    background: #ffebee;
+    border-left-color: #f44336;
+}
+
+/* Вкладки */
+.tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    border-bottom: 2px solid #eee;
+    padding-bottom: 8px;
+}
+
+.tab {
+    padding: 10px 20px;
+    cursor: pointer;
+    background: #f5f5f5;
+    border: none;
+    border-radius: 12px 12px 0 0;
+    transition: all 0.2s;
+    font-weight: 500;
+}
+
+.tab:hover {
+    background: #e0e0e0;
+}
+
+.tab.active {
+    background: linear-gradient(135deg, #3498db, #2980b9);
+    color: white;
+}
+
+/* Формы */
+.form-group {
+    margin-bottom: 16px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 6px;
+    font-weight: 500;
+    color: #2c3e50;
+}
+
+.form-group input, .form-group select {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 14px;
+    transition: border 0.2s;
+}
+
+.form-group input:focus, .form-group select:focus {
+    outline: none;
+    border-color: #3498db;
+}
+
+/* Модальные окна */
+.modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.5);
+    backdrop-filter: blur(4px);
+    z-index: 2000;
+    justify-content: center;
+    align-items: center;
+}
+
+.modal-content {
+    background: white;
+    padding: 24px;
+    border-radius: 20px;
+    width: 90%;
+    max-width: 500px;
+    max-height: 80vh;
+    overflow-y: auto;
+    animation: slideIn 0.3s ease;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateY(-50px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #eee;
+}
+
+.modal-header h3 {
+    margin: 0;
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    font-size: 24px;
+    cursor: pointer;
+    color: #999;
+}
+
+.modal-close:hover {
+    color: #333;
+}
+
+/* Кнопки */
+.btn {
+    background: linear-gradient(135deg, #3498db, #2980b9);
+    border: none;
+    color: white;
+    padding: 10px 20px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.3s ease;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(52,152,219,0.4);
+}
+
+.btn-danger {
+    background: linear-gradient(135deg, #e74c3c, #c0392b);
+}
+
+.btn-danger:hover {
+    box-shadow: 0 4px 12px rgba(231,76,60,0.4);
+}
+
+.btn-success {
+    background: linear-gradient(135deg, #27ae60, #2ecc71);
+}
+
+/* Ползунок */
+.slider {
+    width: 100%;
+    height: 6px;
+    -webkit-appearance: none;
+    background: #ddd;
+    border-radius: 3px;
+    outline: none;
+}
+
+.slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #3498db;
+    cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+.slider-value {
+    display: inline-block;
+    margin-left: 10px;
+    font-weight: bold;
+    color: #3498db;
+}
+
+/* Маркеры на карте */
+.leaflet-div-icon {
+    background: transparent;
+    border: none;
+}
+
+.incident-marker {
+    opacity: 0.9;
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+}
+
+.station-icon-fire {
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+}
+
+.station-icon-ambulance {
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+}
+
+.station-icon-police {
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+}
+
+/* Адаптивность */
+@media (max-width: 768px) {
+    .navbar {
+        flex-direction: column;
+        gap: 8px;
+    }
+    
+    #vehicles-panel {
+        width: 240px;
+        max-height: 300px;
+    }
+    
+    .stat-card {
+        min-width: 120px;
+        padding: 12px;
+    }
+    
+    .stat-number {
+        font-size: 24px;
+    }
+    
+    .tabs {
+        flex-direction: column;
+    }
+    
+    .tab {
+        border-radius: 8px;
+    }
+}

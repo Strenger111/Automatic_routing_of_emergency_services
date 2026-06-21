@@ -1,0 +1,402 @@
+<!-- templates/analytics.html -->
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Аналитика - САМГТ-ЭС</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; }
+        .header { background: #2c3e50; color: white; padding: 15px 20px; }
+        .header a { color: white; text-decoration: none; margin-right: 20px; }
+        .header a:hover { text-decoration: underline; }
+        .container { display: flex; flex-wrap: wrap; padding: 20px; gap: 20px; }
+        .card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .full-width { width: 100%; }
+        .half-width { width: calc(50% - 10px); }
+        .third-width { width: calc(33.33% - 14px); }
+        h2 { color: #2c3e50; margin-bottom: 15px; border-left: 4px solid #3498db; padding-left: 12px; }
+        h3 { color: #34495e; margin: 15px 0 10px 0; }
+        .stats-grid { display: flex; gap: 15px; flex-wrap: wrap; }
+        .stat-box { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 10px; flex: 1; min-width: 150px; text-align: center; }
+        .stat-box.orange { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
+        .stat-box.green { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
+        .stat-number { font-size: 28px; font-weight: bold; }
+        .stat-label { font-size: 12px; opacity: 0.9; margin-top: 5px; }
+        .recommendation { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 12px; margin: 10px 0; border-radius: 8px; }
+        .recommendation.warning { background: #fff3e0; border-left-color: #ff9800; }
+        .recommendation.critical { background: #ffebee; border-left-color: #f44336; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f5f5f5; }
+        .map-container { height: 400px; margin-top: 15px; border-radius: 8px; overflow: hidden; }
+        .tabs { display: flex; gap: 5px; margin-bottom: 15px; border-bottom: 1px solid #ddd; flex-wrap: wrap; }
+        .tab { padding: 10px 20px; cursor: pointer; background: #f5f5f5; border: none; border-radius: 8px 8px 0 0; }
+        .tab.active { background: #3498db; color: white; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .hotspot-marker { background: rgba(255,0,0,0.6); border-radius: 50%; width: 20px; height: 20px; border: 2px solid white; }
+        .patrol-marker { background: rgba(255,165,0,0.8); border-radius: 50%; width: 16px; height: 16px; border: 2px solid white; }
+        @media (max-width: 768px) {
+            .half-width, .third-width { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <a href="/">🗺️ Карта</a>
+        <a href="/admin">🔧 Админ-панель</a>
+        <a href="/analytics" style="font-weight: bold;">📊 Аналитика</a>
+    </div>
+
+    <div class="container">
+        <!-- Статистика в цифрах -->
+        <div class="card full-width">
+            <h2>📈 Ключевые показатели</h2>
+            <div class="stats-grid" id="key-metrics">
+                <div class="stat-box">📊 Загрузка...</div>
+            </div>
+        </div>
+
+        <!-- Вкладки с различными аналитиками -->
+        <div class="card full-width">
+            <div class="tabs">
+                <button class="tab active" data-tab="response">⏱️ Время ответа</button>
+                <button class="tab" data-tab="incidents">📊 Инциденты по часам</button>
+                <button class="tab" data-tab="stations">🏢 Эффективность станций</button>
+                <button class="tab" data-tab="vehicles">🚗 Загрузка машин</button>
+            </div>
+
+            <div id="tab-response" class="tab-content active">
+                <div class="half-width" style="display: inline-block; width: 48%;">
+                    <canvas id="responseChart" height="250"></canvas>
+                </div>
+                <div class="half-width" style="display: inline-block; width: 48%; vertical-align: top;">
+                    <h3>Анализ времени ответа</h3>
+                    <p>Среднее время прибытия на место происшествия по типам вызовов.</p>
+                    <div id="response-insights"></div>
+                </div>
+            </div>
+
+            <div id="tab-incidents" class="tab-content">
+                <canvas id="incidentsChart" height="200"></canvas>
+                <div id="peak-hours-info" style="margin-top: 15px;"></div>
+            </div>
+
+            <div id="tab-stations" class="tab-content">
+                <table id="stations-efficiency-table">
+                    <thead><tr><th>Станция</th><th>Тип</th><th>Обслужено ЧП</th><th>Ср. время (с)</th><th>Оценка эффективности</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+
+            <div id="tab-vehicles" class="tab-content">
+                <table id="vehicles-utilization-table">
+                    <thead><tr><th>ID</th><th>Тип</th><th>Вызовов</th><th>Загрузка (%)</th><th>Ср. время (с)</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Рекомендации по размещению станций -->
+        <div class="card full-width">
+            <h2>📍 Рекомендации по размещению новых станций</h2>
+            <div id="station-recommendations"></div>
+            <div id="hotspots-map" class="map-container"></div>
+        </div>
+
+        <!-- Рекомендации по патрулированию -->
+        <div class="card full-width">
+            <h2>🚓 Рекомендации по усилению патрулирования</h2>
+            <div id="patrol-recommendations"></div>
+        </div>
+
+        <!-- Экономический анализ -->
+        <div class="card half-width">
+            <h2>💰 Экономический анализ</h2>
+            <div id="economic-analysis"></div>
+        </div>
+
+        <!-- Зоны перекрытия -->
+        <div class="card half-width">
+            <h2>🔄 Перекрытие зон станций</h2>
+            <div id="zone-overlap"></div>
+        </div>
+    </div>
+
+    <script>
+        let responseChart, incidentsChart;
+        let hotspotsMap, patrolMap;
+
+        async function loadAnalytics() {
+            await loadKeyMetrics();
+            await loadResponseStats();
+            await loadIncidentsPerHour();
+            await loadStationEfficiency();
+            await loadVehicleUtilization();
+            await loadStationRecommendations();
+            await loadPatrolRecommendations();
+            await loadEconomicAnalysis();
+            await loadZoneOverlap();
+        }
+
+        async function loadKeyMetrics() {
+            try {
+                const [incidentStats, vehicleStats, stationsRes] = await Promise.all([
+                    fetch('/api/admin/stats/incidents').then(r => r.json()),
+                    fetch('/api/admin/stats/vehicles').then(r => r.json()),
+                    fetch('/api/admin/stations').then(r => r.json())
+                ]);
+
+                const totalCalls = vehicleStats.reduce((sum, v) => sum + v.total_calls, 0);
+                const avgResponse = vehicleStats.reduce((sum, v) => sum + v.avg_response_sec, 0) / Math.max(1, vehicleStats.length);
+
+                document.getElementById('key-metrics').innerHTML = `
+                    <div class="stat-box">📊 Решено ЧП<br><span class="stat-number">${incidentStats.total_resolved}</span></div>
+                    <div class="stat-box orange">🚗 Всего вызовов<br><span class="stat-number">${totalCalls}</span></div>
+                    <div class="stat-box green">⏱️ Ср. время ответа<br><span class="stat-number">${avgResponse.toFixed(1)}</span><span class="stat-label">сек</span></div>
+                    <div class="stat-box">🏢 Станций<br><span class="stat-number">${stationsRes.length}</span></div>
+                `;
+            } catch(e) { console.error('loadKeyMetrics error:', e); }
+        }
+
+        async function loadResponseStats() {
+            try {
+                const res = await fetch('/api/analytics/avg_response');
+                const data = await res.json();
+
+                const types = Object.keys(data);
+                const times = Object.values(data);
+
+                if (responseChart) responseChart.destroy();
+                responseChart = new Chart(document.getElementById('responseChart'), {
+                    type: 'bar',
+                    data: { labels: types, datasets: [{ label: 'Время ответа (сек)', data: times, backgroundColor: '#3498db' }] },
+                    options: { responsive: true, maintainAspectRatio: true }
+                });
+
+                const bestType = types.reduce((a,b) => data[a] < data[b] ? a : b, types[0]);
+                const worstType = types.reduce((a,b) => data[a] > data[b] ? a : b, types[0]);
+                document.getElementById('response-insights').innerHTML = `
+                    <p>✅ <strong>Лучшее время:</strong> ${bestType} — ${data[bestType].toFixed(1)} сек</p>
+                    <p>⚠️ <strong>Худшее время:</strong> ${worstType} — ${data[worstType].toFixed(1)} сек</p>
+                    <p>💡 Рекомендуется усилить парк машин типа "${worstType}" для сокращения времени реакции.</p>
+                `;
+            } catch(e) { console.error('loadResponseStats error:', e); }
+        }
+
+        async function loadIncidentsPerHour() {
+            try {
+                const res = await fetch('/api/analytics/incidents_per_hour?hours=48');
+                const data = await res.json();
+
+                const hours = data.map(d => d.hour_local ? new Date(d.hour_local).toLocaleTimeString([], {hour:'2-digit'}) : d.hour.split('T')[1]?.slice(0,5) || d.hour);
+                const counts = data.map(d => d.count);
+
+                if (incidentsChart) incidentsChart.destroy();
+                incidentsChart = new Chart(document.getElementById('incidentsChart'), {
+                    type: 'line',
+                    data: { labels: hours, datasets: [{ label: 'Количество ЧП', data: counts, borderColor: '#e74c3c', backgroundColor: 'rgba(231,76,60,0.1)', fill: true, tension: 0.3 }] },
+                    options: { responsive: true, maintainAspectRatio: true }
+                });
+
+                const maxCount = Math.max(...counts);
+                const peakHour = hours[counts.indexOf(maxCount)];
+                document.getElementById('peak-hours-info').innerHTML = `
+                    <p>📈 <strong>Пиковая нагрузка:</strong> ${peakHour} (${maxCount} ЧП в час)</p>
+                    <p>💡 Рекомендуется увеличить количество патрульных машин в часы пик.</p>
+                `;
+            } catch(e) { console.error('loadIncidentsPerHour error:', e); }
+        }
+
+        async function loadStationEfficiency() {
+            try {
+                const res = await fetch('/api/analytics/station_coverage');
+                const data = await res.json();
+
+                const tbody = document.querySelector('#stations-efficiency-table tbody');
+                tbody.innerHTML = '';
+
+                data.forEach(station => {
+                    const totalHouses = Object.values(station.zones).reduce((a,b) => a + b, 0);
+                    const efficiency = totalHouses > 0 ? (station.zones['0-5 мин'] / totalHouses * 100).toFixed(1) : 0;
+                    const row = tbody.insertRow();
+                    row.insertCell(0).textContent = station.name;
+                    row.insertCell(1).textContent = station.type;
+                    row.insertCell(2).textContent = Object.values(station.zones).reduce((a,b) => a + b, 0);
+                    row.insertCell(3).textContent = '-';
+                    row.insertCell(4).innerHTML = efficiency > 70 ? '🟢 Высокая' : (efficiency > 40 ? '🟡 Средняя' : '🔴 Низкая');
+                });
+            } catch(e) { console.error('loadStationEfficiency error:', e); }
+        }
+
+        async function loadVehicleUtilization() {
+            try {
+                const res = await fetch('/api/admin/stats/vehicles');
+                const vehicles = await res.json();
+
+                const tbody = document.querySelector('#vehicles-utilization-table tbody');
+                tbody.innerHTML = '';
+
+                for (const v of vehicles) {
+                    const utilRes = await fetch(`/api/analytics/vehicle_utilization/${v.id}?hours=24`);
+                    const util = await utilRes.json();
+                    const utilizationPercent = util ? (util.utilization * 100).toFixed(1) : 0;
+                    const row = tbody.insertRow();
+                    row.insertCell(0).textContent = v.id;
+                    row.insertCell(1).textContent = v.type;
+                    row.insertCell(2).textContent = v.total_calls;
+                    row.insertCell(3).innerHTML = utilizationPercent > 70 ? '🔴 ' + utilizationPercent + '%' : (utilizationPercent > 40 ? '🟡 ' + utilizationPercent + '%' : '🟢 ' + utilizationPercent + '%');
+                    row.insertCell(4).textContent = v.avg_response_sec.toFixed(1);
+                }
+            } catch(e) { console.error('loadVehicleUtilization error:', e); }
+        }
+
+        async function loadStationRecommendations() {
+            try {
+                const res = await fetch('/api/analytics/hot_zones');
+                let hotZones = [];
+                try { hotZones = await res.json(); } catch(e) { hotZones = []; }
+
+                const recommendationsDiv = document.getElementById('station-recommendations');
+
+                if (!hotZones || hotZones.length === 0) {
+                    recommendationsDiv.innerHTML = '<p>📊 Недостаточно данных для рекомендаций. Создайте больше инцидентов.</p>';
+                    return;
+                }
+
+                recommendationsDiv.innerHTML = hotZones.map(zone => `
+                    <div class="recommendation ${zone.incident_count > 10 ? 'critical' : (zone.incident_count > 5 ? 'warning' : '')}">
+                        <strong>📍 ${zone.type === 'fire' ? '🔥' : (zone.type === 'ambulance' ? '🚑' : '👮')} Рекомендуемое место для станции</strong><br>
+                        Координаты: ${zone.lat.toFixed(5)}, ${zone.lon.toFixed(5)}<br>
+                        Инцидентов в зоне: ${zone.incident_count}<br>
+                        Радиус кластера: ${zone.radius_km?.toFixed(2) || 'N/A'} км<br>
+                        <span style="color: ${zone.incident_count > 10 ? '#c0392b' : (zone.incident_count > 5 ? '#e67e22' : '#27ae60')}">
+                            ${zone.incident_count > 10 ? '🔴 КРИТИЧЕСКАЯ НЕОБХОДИМОСТЬ' : (zone.incident_count > 5 ? '🟡 РЕКОМЕНДУЕТСЯ' : '🟢 ЖЕЛАТЕЛЬНО')}
+                        </span>
+                    </div>
+                `).join('');
+
+                if (typeof L !== 'undefined') {
+                    if (hotspotsMap) hotspotsMap.remove();
+                    hotspotsMap = L.map('hotspots-map').setView([56.73, 37.17], 12);
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap' }).addTo(hotspotsMap);
+
+                    hotZones.forEach(zone => {
+                        const color = zone.incident_count > 10 ? '#c0392b' : (zone.incident_count > 5 ? '#e67e22' : '#27ae60');
+                        const marker = L.circleMarker([zone.lat, zone.lon], {
+                            radius: Math.min(20, 10 + zone.incident_count),
+                            fillColor: color,
+                            color: 'white',
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 0.7
+                        }).addTo(hotspotsMap);
+                        marker.bindPopup(`
+                            <b>${zone.type === 'fire' ? '🔥 Пожарная' : (zone.type === 'ambulance' ? '🚑 Скорая' : '👮 Полиция')}</b><br>
+                            Инцидентов: ${zone.incident_count}<br>
+                            <button onclick="alert('Рекомендация по размещению станции в этом месте')">📌 Предложить станцию</button>
+                        `);
+                    });
+                }
+            } catch(e) { console.error('loadStationRecommendations error:', e); }
+        }
+
+        async function loadPatrolRecommendations() {
+            try {
+                const res = await fetch('/api/analytics/patrol_recommendations');
+                let patrolRecs = [];
+                try { patrolRecs = await res.json(); } catch(e) { patrolRecs = []; }
+
+                const patrolDiv = document.getElementById('patrol-recommendations');
+
+                if (!patrolRecs || patrolRecs.length === 0) {
+                    patrolDiv.innerHTML = '<p>🚓 Рекомендации по патрулированию появятся после накопления статистики.</p>';
+                    return;
+                }
+
+                patrolDiv.innerHTML = patrolRecs.map(rec => `
+                    <div class="recommendation warning">
+                        <strong>🚓 От станции "${rec.station_name}"</strong><br>
+                        Рекомендуемое место патруля: ${rec.recommended_patrol_lat?.toFixed(5)}, ${rec.recommended_patrol_lon?.toFixed(5)}<br>
+                        Дальних инцидентов: ${rec.far_incidents_count}<br>
+                        Причина: ${rec.reason}<br>
+                        <span style="color: #e67e22;">💡 Рекомендуется отправить патрульную машину в эту зону</span>
+                    </div>
+                `).join('');
+            } catch(e) { console.error('loadPatrolRecommendations error:', e); }
+        }
+
+        async function loadEconomicAnalysis() {
+            try {
+                const res = await fetch('/api/analytics/economic_analysis');
+                let analysis = [];
+                try { analysis = await res.json(); } catch(e) { analysis = []; }
+
+                const economicDiv = document.getElementById('economic-analysis');
+
+                if (!analysis || analysis.length === 0) {
+                    economicDiv.innerHTML = '<p>💰 Экономический анализ будет доступен после обработки инцидентов.</p>';
+                    return;
+                }
+
+                const totalCost = analysis.reduce((sum, s) => sum + s.estimated_cost_rub, 0);
+                const bestStation = analysis.reduce((best, s) => s.efficiency_score > best.efficiency_score ? s : best, analysis[0]);
+
+                economicDiv.innerHTML = `
+                    <p><strong>Общая оценочная стоимость обслуживания:</strong> ${totalCost.toLocaleString()} руб.</p>
+                    <p><strong>Самая эффективная станция:</strong> ${bestStation.station_name} (оценка: ${bestStation.efficiency_score})</p>
+                    <table style="margin-top: 10px;">
+                        <thead><tr><th>Станция</th><th>ЧП обслужено</th><th>Ср. время (с)</th><th>Оценка</th></tr></thead>
+                        <tbody>
+                            ${analysis.map(s => `<tr><td>${s.station_name}</td><td>${s.incidents_handled}</td><td>${s.avg_response_sec}</td><td>${s.efficiency_score}</td></tr>`).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } catch(e) { console.error('loadEconomicAnalysis error:', e); }
+        }
+
+        async function loadZoneOverlap() {
+            try {
+                const res = await fetch('/api/analytics/zone_overlap');
+                let overlaps = [];
+                try { overlaps = await res.json(); } catch(e) { overlaps = []; }
+
+                const overlapDiv = document.getElementById('zone-overlap');
+
+                if (!overlaps || overlaps.length === 0) {
+                    overlapDiv.innerHTML = '<p>🔄 Нет перекрытий зон или недостаточно данных.</p>';
+                    return;
+                }
+
+                overlapDiv.innerHTML = `
+                    <table>
+                        <thead><tr><th>Станция A</th><th>Станция B</th><th>Перекрытие</th></tr></thead>
+                        <tbody>
+                            ${overlaps.map(o => `<tr><td>${o.station_a}</td><td>${o.station_b}</td><td>${o.overlap_percent}%</td></tr>`).join('')}
+                        </tbody>
+                    </table>
+                    <p style="margin-top: 10px; font-size: 12px; color: #666;">💡 Большое перекрытие зон может указывать на избыточность станций в этом районе.</p>
+                `;
+            } catch(e) { console.error('loadZoneOverlap error:', e); }
+        }
+
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+            });
+        });
+
+        loadAnalytics();
+        setInterval(loadAnalytics, 30000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,3176 @@
+Корневая папка: C:\pygis\devel\olgis\city_monitor
+================================================================================
+
+
+📁 [корень]/
+------------------------------------------------------------
+
+📄 app.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+from flask import Flask, render_template, jsonify, request, current_app
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
+import osmnx as ox
+from models import DataModel
+from routing import compute_zones, count_houses_in_zones, compute_travel_time
+from simulation import start_simulation, vehicles_dict, assign_incident_to_vehicle, get_best_vehicle_for_incident, add_to_pending_incident, datetime, add_vehicle, delete_vehicle_from_dict, stop_vehicle_patrol, dispatch_pending_incidents
+from database import Session, Station as DBStation, Vehicle as DBVehicle, Incident as DBIncident
+import os
+from celery import Celery
+import logging
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+app.config['CELERY_BROKER_URL'] = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+app.config['CELERY_RESULT_BACKEND'] = app.config['CELERY_BROKER_URL']
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+def make_celery(app):
+    celery = Celery(app.import_name,
+                    broker=app.config['CELERY_BROKER_URL'],
+                    backend=app.config['CELERY_RESULT_BACKEND'])
+    celery.conf.update(app.config)
+    return celery
+
+celery = make_celery(app)
+CORS(app)
+data = DataModel()
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@socketio.on('connect')
+def on_connect():
+    print("Client connected")
+    start_simulation(socketio, data)
+
+# REST API: Дома
+@app.route('/api/houses')
+def houses():
+    return data.houses_gdf.to_json()
+
+# REST API: Станции
+@app.route('/api/stations')
+def stations():
+    session = Session()
+    db_stations = session.query(DBStation).all()
+    features = [{
+        "type": "Feature",
+        "geometry": {"type": "Point", "coordinates": [st.lon, st.lat]},
+        "properties": {"id": st.id, "name": st.name, "type": st.type}
+    } for st in db_stations]
+    session.close()
+    return jsonify({"type": "FeatureCollection", "features": features})
+
+# REST API: Дороги
+@app.route('/api/roads')
+def roads():
+    edges = ox.graph_to_gdfs(data.graph, nodes=False)[['geometry']]
+    return edges.to_json()
+
+# REST API: Зоны станции
+@app.route('/api/station/<int:sid>/zones')
+def zones(sid):
+    session = Session()
+    station = session.get(DBStation, sid)
+    session.close()
+    if not station:
+        return {"error": "station not found"}, 404
+    zones_dict = compute_zones(
+        station.node_id, data.graph,
+        data.config['speed_kmh'], data.config['time_limits_sec']
+    )
+    return jsonify(zones_dict)
+
+@app.route('/api/station/<int:sid>/house_counts')
+def station_house_counts(sid):
+    session = Session()
+    station = session.get(DBStation, sid)
+    session.close()
+    if not station:
+        return {"error": "station not found"}, 404
+    zones_dict = compute_zones(station.node_id, data.graph,
+                               data.config['speed_kmh'], data.config['time_limits_sec'])
+    counts = count_houses_in_zones(zones_dict, data.houses_gdf)
+    return jsonify(counts)
+
+@app.route('/api/vehicle_zones', methods=['POST'])
+def vehicle_zones():
+    lat = request.json.get('lat'); lon = request.json.get('lon')
+    if lat is None or lon is None:
+        return {"error": "missing lat/lon"}, 400
+    node = data.get_nearest_node(lat, lon)
+    zones_dict = compute_zones(node, data.graph,
+                               data.config['speed_kmh'], data.config['time_limits_sec'])
+    return jsonify(zones_dict)
+
+@app.route('/api/house/<int:hid>/nearest')
+def nearest(hid):
+    if hid < 0 or hid >= len(data.houses_gdf):
+        return {"error": "invalid house id"}, 404
+    house_node = data.houses_gdf.iloc[hid]['node_id']
+    session = Session()
+    stations = session.query(DBStation).all()
+    res = []
+    for st in stations:
+        t = compute_travel_time(data.graph, st.node_id, house_node, data.config['speed_kmh'])
+        res.append({"station": st.name, "eta": t})
+    session.close()
+    return jsonify(sorted(res, key=lambda x: x['eta'])[:3])
+
+# Создание ЧП (новая логика)
+@app.route('/api/incidents', methods=['POST'])
+def create_incident():
+    lat = request.json.get('lat'); lon = request.json.get('lon'); typ = request.json.get('type', 'unknown')
+    logging.info(f"Creating incident at {lat},{lon} of type {typ}")
+    session = Session()
+    vehicle_id, incident_node = get_best_vehicle_for_incident(lat, lon, typ, data.graph, vehicles_dict, data.config)
+    if vehicle_id is not None:
+        incident = DBIncident(type=typ, lat=lat, lon=lon, assigned_vehicle_id=vehicle_id)
+        session.add(incident); session.commit()
+        incident_id = incident.id
+        success = assign_incident_to_vehicle(vehicle_id, lat, lon, incident_id, typ, data.graph, socketio)
+        if success:
+            vehicle_db = session.get(DBVehicle, vehicle_id)
+            if vehicle_db:
+                vehicle_db.status = 'responding'
+                session.commit()
+            socketio.emit('incident_created', {
+                'id': incident_id, 'lat': lat, 'lon': lon,
+                'type': typ, 'vehicle_id': vehicle_id
+            })
+            session.close()
+            return jsonify({"incident_id": incident_id, "vehicle_id": vehicle_id})
+        else:
+            session.rollback()
+            session.close()
+            return jsonify({"error": "route not found"}), 500
+    else:
+        incident = DBIncident(type=typ, lat=lat, lon=lon, assigned_vehicle_id=None)
+        session.add(incident); session.commit()
+        incident_id = incident.id
+        session.close()
+        add_to_pending_incident(lat, lon, typ, incident_id)
+        dispatch_pending_incidents()
+        return jsonify({"incident_id": incident_id, "message": "queued, no vehicle available"}), 202
+
+# Создание станции
+@app.route('/api/stations', methods=['POST'])
+def create_station():
+    data_json = request.get_json()
+    name = data_json.get('name'); typ = data_json.get('type')
+    lat = data_json.get('lat'); lon = data_json.get('lon')
+    max_vehicles = data_json.get('max_vehicles', 3)
+    if not (name and typ and lat and lon):
+        return {"error": "missing fields"}, 400
+    node_id = data.get_nearest_node(lat, lon)
+    session = Session()
+    max_id = session.query(DBStation.id).order_by(DBStation.id.desc()).first()
+    new_id = (max_id[0]+1) if max_id else 1
+    station = DBStation(id=new_id, name=name, type=typ, lat=lat, lon=lon, node_id=node_id, max_vehicles=max_vehicles)
+    session.add(station); session.commit()
+    # Создаём начальные машины (не более max_vehicles)
+    for i in range(min(2, max_vehicles)):
+        vehicle = DBVehicle(
+            name=f"{typ}_{new_id}_{i+1}", type=typ, status="idle",
+            station_id=new_id, is_temp=False
+        )
+        session.add(vehicle)
+    session.commit()
+    session.close()
+    data.stations.append({"id": new_id, "name": name, "type": typ,
+                          "lat": lat, "lon": lon, "node_id": node_id, "max_vehicles": max_vehicles})
+    start_simulation(socketio, data)
+    return jsonify({"id": new_id})
+
+# ===================== АДМИНКА =====================
+@app.route('/admin')
+def admin():
+    return render_template('admin.html')
+
+@app.route('/api/admin/stations')
+def admin_stations():
+    session = Session()
+    stations = session.query(DBStation).all()
+    res = [{"id": s.id, "name": s.name, "type": s.type, "lat": s.lat, "lon": s.lon, "max_vehicles": s.max_vehicles} for s in stations]
+    session.close()
+    return jsonify(res)
+
+@app.route('/api/admin/vehicles')
+def admin_vehicles():
+    session = Session()
+    vehicles = session.query(DBVehicle).all()
+    res = []
+    for v in vehicles:
+        res.append({
+            "id": v.id, "name": v.name, "type": v.type, "status": v.status,
+            "station_name": v.station.name if v.station else None,
+            "total_calls": v.total_calls, "avg_response_time": v.avg_response_time,
+            "is_temp": v.is_temp, "service_time": v.service_time
+        })
+    session.close()
+    return jsonify(res)
+
+# Добавить машину (с проверкой лимита)
+@app.route('/api/admin/vehicles', methods=['POST'])
+def admin_add_vehicle():
+    data_req = request.json
+    station_id = data_req.get('station_id')
+    veh_type = data_req.get('type')
+    name = data_req.get('name', f"{veh_type}_auto")
+    service_time = data_req.get('service_time', 2)
+    if not station_id or not veh_type:
+        return {"error": "station_id and type required"}, 400
+    session = Session()
+    try:
+        station = session.get(DBStation, station_id)
+        if not station:
+            return {"error": "station not found"}, 404
+        current_count = session.query(DBVehicle).filter_by(station_id=station_id, is_temp=False).count()
+        if current_count >= station.max_vehicles:
+            return {"error": f"Maximum {station.max_vehicles} vehicles for this station"}, 400
+        station_node_id = station.node_id
+        new_vehicle = DBVehicle(
+            name=name, type=veh_type, status='idle',
+            station_id=station_id, is_temp=False, service_time=service_time
+        )
+        session.add(new_vehicle)
+        session.commit()
+        vehicle_id = new_vehicle.id
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    # Машина добавляется на станцию и изначально скрыта
+    add_vehicle(vehicle_id, station_node_id, data.graph,
+                data.config['speed_kmh'], vehicle_id,
+                station_node=station_node_id, vehicle_type=veh_type,
+                service_time=service_time, is_temp=False, inside_station=True)
+    logging.info(f"Vehicle {vehicle_id} added to vehicles_dict")
+    start_simulation(socketio, data)
+    return jsonify({"id": vehicle_id})
+
+# Удалить машину
+@app.route('/api/admin/vehicles/<int:vid>', methods=['DELETE'])
+def delete_vehicle(vid):
+    stop_vehicle_patrol(vid)
+    if vid in vehicles_dict:
+        del vehicles_dict[vid]
+    session = Session()
+    try:
+        session.query(DBIncident).filter_by(assigned_vehicle_id=vid).update({DBIncident.assigned_vehicle_id: None})
+        session.query(DBVehicle).filter_by(id=vid).delete()
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    start_simulation(socketio, data)
+    return jsonify({"success": True})
+
+# Редактировать машину
+@app.route('/api/admin/vehicles/<int:vid>', methods=['PUT'])
+def edit_vehicle(vid):
+    data_req = request.json
+    name = data_req.get('name')
+    service_time = data_req.get('service_time')
+    session_db = Session()
+    try:
+        vehicle = session_db.get(DBVehicle, vid)
+        if not vehicle:
+            return {"error": "vehicle not found"}, 404
+        if name:
+            vehicle.name = name
+        if service_time is not None:
+            vehicle.service_time = service_time
+            if vid in vehicles_dict:
+                vehicles_dict[vid].service_time_sec = service_time
+        session_db.commit()
+    except Exception as e:
+        session_db.rollback()
+        raise e
+    finally:
+        session_db.close()
+    return jsonify({"success": True})
+
+# Удалить станцию
+@app.route('/api/admin/stations/<int:sid>', methods=['DELETE'])
+def delete_station(sid):
+    session = Session()
+    try:
+        station = session.get(DBStation, sid)
+        if station:
+            for vid in list(vehicles_dict.keys()):
+                v = vehicles_dict.get(vid)
+                if v and hasattr(v, 'station_node') and v.station_node == station.node_id:
+                    stop_vehicle_patrol(vid)
+                    del vehicles_dict[vid]
+            for vehicle in session.query(DBVehicle).filter_by(station_id=sid):
+                session.query(DBIncident).filter_by(assigned_vehicle_id=vehicle.id).update({DBIncident.assigned_vehicle_id: None})
+            session.query(DBVehicle).filter_by(station_id=sid).delete()
+            session.delete(station)
+            session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    start_simulation(socketio, data)
+    return jsonify({"success": True})
+
+# Редактировать станцию
+@app.route('/api/admin/stations/<int:sid>', methods=['PUT'])
+def edit_station(sid):
+    data_req = request.json
+    session = Session()
+    try:
+        station = session.get(DBStation, sid)
+        if not station:
+            return {"error": "station not found"}, 404
+        if 'name' in data_req:
+            station.name = data_req['name']
+        if 'type' in data_req:
+            station.type = data_req['type']
+        if 'max_vehicles' in data_req:
+            station.max_vehicles = data_req['max_vehicles']
+        if 'lat' in data_req and 'lon' in data_req:
+            station.lat = data_req['lat']
+            station.lon = data_req['lon']
+            station.node_id = data.get_nearest_node(station.lat, station.lon)
+        session.commit()
+        # Обновляем кэш
+        data.stations = []
+        db_stations = session.query(DBStation).all()
+        for st in db_stations:
+            data.stations.append({
+                "id": st.id, "name": st.name, "type": st.type,
+                "lat": st.lat, "lon": st.lon, "node_id": st.node_id,
+                "max_vehicles": st.max_vehicles
+            })
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    start_simulation(socketio, data)
+    return jsonify({"success": True})
+
+# Решить инцидент (админ)
+@app.route('/api/admin/incidents/<int:iid>/resolve', methods=['POST'])
+def resolve_incident_admin(iid):
+    session = Session()
+    incident = session.get(DBIncident, iid)
+    if incident and not incident.resolved:
+        incident.resolved = True
+        incident.response_time_sec = 0
+        if incident.assigned_vehicle_id:
+            vehicle = session.get(DBVehicle, incident.assigned_vehicle_id)
+            if vehicle and not vehicle.is_temp:
+                vehicle.status = 'idle'
+                session.commit()
+        session.commit()
+        socketio.emit('incident_resolved', {'incident_id': iid})
+        dispatch_pending_incidents()
+    session.close()
+    return jsonify({"success": True})
+
+# Получить нерешённые инциденты
+@app.route('/api/admin/incidents')
+def admin_incidents():
+    session = Session()
+    incidents = session.query(DBIncident).filter_by(resolved=False).all()
+    res = [{"id": i.id, "type": i.type, "lat": i.lat, "lon": i.lon,
+            "created_at": i.created_at.isoformat(), "assigned_vehicle_id": i.assigned_vehicle_id}
+           for i in incidents]
+    session.close()
+    return jsonify(res)
+
+# ===================== СТАТИСТИКА =====================
+@app.route('/api/admin/stats/incidents')
+def incident_stats():
+    session = Session()
+    from sqlalchemy import func
+    total_by_type = session.query(DBIncident.type, func.count(DBIncident.id)).filter_by(resolved=True).group_by(DBIncident.type).all()
+    avg_response_by_type = session.query(DBIncident.type, func.avg(DBIncident.response_time_sec)).filter_by(resolved=True).group_by(DBIncident.type).all()
+    stats = {
+        "total_resolved": session.query(DBIncident).filter_by(resolved=True).count(),
+        "by_type": {t: cnt for t, cnt in total_by_type},
+        "avg_response_sec_by_type": {t: float(avg or 0) for t, avg in avg_response_by_type}
+    }
+    session.close()
+    return jsonify(stats)
+
+@app.route('/api/admin/stats/vehicles')
+def vehicle_stats():
+    session = Session()
+    vehicles = session.query(DBVehicle).filter(DBVehicle.total_calls > 0).all()
+    res = []
+    for v in vehicles:
+        res.append({
+            "id": v.id,
+            "name": v.name,
+            "type": v.type,
+            "total_calls": v.total_calls,
+            "avg_response_sec": v.avg_response_time or 0,
+            "station_name": v.station.name if v.station else None
+        })
+    session.close()
+    return jsonify(res)
+
+# Патрулирование
+@app.route('/api/admin/vehicles/<int:vid>/patrol', methods=['POST'])
+def vehicle_patrol(vid):
+    data_req = request.get_json() or {}
+    duration = data_req.get('duration_sec')
+    logging.info(f"Patrol request for vehicle {vid}, vehicles_dict keys: {list(vehicles_dict.keys())}")
+    v = vehicles_dict.get(vid)
+    if not v:
+        return {"error": "vehicle not found"}, 404
+    if v.status not in ('idle', 'moving'):
+        return {"error": f"cannot patrol in status {v.status}"}, 400
+    v.start_patrol(duration)
+    return jsonify({"success": True})
+
+@app.route('/api/admin/vehicles/<int:vid>/return', methods=['POST'])
+def vehicle_return(vid):
+    v = vehicles_dict.get(vid)
+    if not v:
+        return {"error": "vehicle not found"}, 404
+    v.return_to_station()
+    return jsonify({"success": True})
+
+@socketio.on('disconnect')
+def on_disconnect():
+    print("Client disconnected")
+
+if __name__ == "__main__":
+    socketio.run(app, port=5000, debug=True)
+
+========================================
+
+📄 data_prep.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import os
+import osmnx as ox
+import geopandas as gpd
+from shapely.geometry import Point
+import json
+
+ox.settings.use_cache = True
+ox.settings.cache_folder = "./cache/osmnx"
+ox.settings.overpass_endpoint = "https://overpass-api.de/api/interpreter"
+
+os.makedirs("static/data", exist_ok=True)
+
+# Задаём ограничивающий прямоугольник (bbox)
+north, south, east, west = 56.75, 56.70, 37.20, 37.10
+
+print("Loading graph...")
+G = ox.graph_from_bbox(north, south, east, west, network_type="drive")
+ox.save_graphml(G, "static/data/graph.graphml")
+print("Graph saved.")
+
+print("Loading buildings...")
+tags = {"building": True}
+buildings = ox.features_from_bbox(north, south, east, west, tags=tags)[["geometry"]]
+buildings_proj = buildings.to_crs("EPSG:3857")
+buildings_proj["centroid"] = buildings_proj.geometry.centroid
+houses = gpd.GeoDataFrame(geometry=buildings_proj["centroid"].to_crs("EPSG:4326"))
+houses = houses.sample(min(len(houses), 1500))
+houses.to_file("static/data/houses.geojson", driver="GeoJSON")
+print(f"Houses: {len(houses)} saved.")
+
+stations = [
+    {"id": 1, "name": "Пожарная", "type": "fire", "lat": 56.734, "lon": 37.162},
+    {"id": 2, "name": "Скорая", "type": "ambulance", "lat": 56.741, "lon": 37.178},
+    {"id": 3, "name": "Полиция", "type": "police", "lat": 56.728, "lon": 37.155}
+]
+with open("static/data/stations.json", "w", encoding="utf-8") as f:
+    json.dump(stations, f, ensure_ascii=False, indent=2)
+print("Initial stations saved.")
+
+========================================
+
+📄 database.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
+
+Base = declarative_base()
+
+class Station(Base):
+    __tablename__ = 'stations'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    type = Column(String)
+    lat = Column(Float)
+    lon = Column(Float)
+    node_id = Column(Integer)
+    max_vehicles = Column(Integer, default=3)   # максимальное количество машин на станции
+    vehicles = relationship("Vehicle", back_populates="station", cascade="all, delete")
+
+class Vehicle(Base):
+    __tablename__ = 'vehicles'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    type = Column(String)
+    status = Column(String)  # idle, moving, responding, returning, servicing, patrolling
+    station_id = Column(Integer, ForeignKey('stations.id'))
+    station = relationship("Station", back_populates="vehicles")
+    total_calls = Column(Integer, default=0)
+    total_response_time = Column(Float, default=0.0)
+    avg_response_time = Column(Float, default=0.0)
+    is_temp = Column(Boolean, default=False)
+    service_time = Column(Float, default=30.0)   # время обслуживания на ЧП (сек)
+
+class Incident(Base):
+    __tablename__ = 'incidents'
+    id = Column(Integer, primary_key=True)
+    type = Column(String)
+    lat = Column(Float)
+    lon = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    assigned_vehicle_id = Column(Integer, ForeignKey('vehicles.id'))
+    response_time_sec = Column(Float, nullable=True)
+    resolved = Column(Boolean, default=False)
+
+engine = create_engine('postgresql://postgres:1109@localhost/emergency_db')
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+
+========================================
+
+📄 generate_houses.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import osmnx as ox
+import geopandas as gpd
+
+# Загружаем граф
+G = ox.load_graphml("static/data/graph.graphml")
+nodes_gdf = ox.graph_to_gdfs(G, edges=False)
+
+# Берём 500 случайных узлов графа (это будут "дома" на дорогах)
+sample_nodes = nodes_gdf.sample(min(500, len(nodes_gdf)))
+houses = gpd.GeoDataFrame(geometry=sample_nodes.geometry, crs="EPSG:4326")
+houses.to_file("static/data/houses.geojson", driver="GeoJSON")
+print(f"Создано {len(houses)} тестовых домов")
+
+========================================
+
+📄 init_db.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+from sqlalchemy import create_engine, text
+engine = create_engine('postgresql://postgres:1109@localhost/', isolation_level='AUTOCOMMIT')
+with engine.connect() as conn:
+    result = conn.execute(text("SELECT 1 FROM pg_database WHERE datname='emergency_db'"))
+    if not result.fetchone():
+        conn.execute(text("CREATE DATABASE emergency_db"))
+        print("Created database emergency_db")
+    else:
+        print("Database already exists")
+from database import Base, engine as db_engine
+Base.metadata.create_all(db_engine)
+print("Tables created.")
+
+========================================
+
+📄 models.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import osmnx as ox
+import geopandas as gpd
+import json
+from database import Session, Station as DBStation
+
+class DataModel:
+    def __init__(self):
+        print("Loading data...")
+        self.graph = ox.load_graphml("static/data/graph.graphml")
+        self.houses_gdf = gpd.read_file("static/data/houses.geojson")
+        if self.houses_gdf.crs is None:
+            self.houses_gdf.set_crs("EPSG:4326", inplace=True)
+        # Загрузка станций из БД
+        session = Session()
+        db_stations = session.query(DBStation).all()
+        self.stations = []
+        for st in db_stations:
+            self.stations.append({
+                "id": st.id, "name": st.name, "type": st.type,
+                "lat": st.lat, "lon": st.lon,
+                "node_id": st.node_id if st.node_id else self.get_nearest_node(st.lat, st.lon),
+                "max_vehicles": st.max_vehicles
+            })
+        session.close()
+        # Если станций нет (пустая БД), загрузим из JSON
+        if not self.stations:
+            with open("static/data/stations.json", encoding="utf-8") as f:
+                json_stations = json.load(f)
+            session = Session()
+            for st in json_stations:
+                node_id = self.get_nearest_node(st['lat'], st['lon'])
+                db_st = DBStation(id=st['id'], name=st['name'], type=st['type'],
+                                  lat=st['lat'], lon=st['lon'], node_id=node_id,
+                                  max_vehicles=3)
+                session.add(db_st)
+                self.stations.append({
+                    "id": st['id'], "name": st['name'], "type": st['type'],
+                    "lat": st['lat'], "lon": st['lon'], "node_id": node_id,
+                    "max_vehicles": 3
+                })
+            session.commit()
+            session.close()
+        # Скорость увеличена в 2 раза (было 50 -> 100)
+        self.config = {"speed_kmh": 100, "time_limits_sec": [300, 600, 900], "service_time_sec": 2}
+        # Привязка домов к узлам графа
+        self._attach_nodes()
+        print(f"Loaded: {len(self.houses_gdf)} houses, {len(self.stations)} stations.")
+
+    def _attach_nodes(self):
+        if self.houses_gdf.crs != "EPSG:4326":
+            self.houses_gdf = self.houses_gdf.to_crs("EPSG:4326")
+        self.houses_gdf['node_id'] = ox.nearest_nodes(
+            self.graph, X=self.houses_gdf.geometry.x, Y=self.houses_gdf.geometry.y)
+
+    def get_nearest_node(self, lat, lon):
+        return ox.nearest_nodes(self.graph, lon, lat)
+
+========================================
+
+📄 pgAdmin.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import psycopg2
+
+conn = psycopg2.connect(
+    dbname="emergency_db",
+    user="postgres",
+    password="1109",
+    host="localhost",
+    port="5432"
+)
+
+print("✅ OK")
+conn.close()
+
+========================================
+
+📄 requirements.txt
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Flask==2.3.3
+flask-cors==4.0.0
+flask-socketio==5.3.4
+eventlet==0.33.3
+osmnx==1.7.0
+networkx==2.8.8
+geopandas==0.14.0
+shapely
+openpyxl==3.1.2
+reportlab==4.0.4
+
+========================================
+
+📄 routing.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import networkx as nx
+from utils.isochrone_polygons import get_isochrone_rings
+
+def compute_travel_time(graph, from_node, to_node, speed_kmh=50):
+    try:
+        length = nx.shortest_path_length(graph, from_node, to_node, weight='length')
+        return length / (speed_kmh / 3.6)
+    except:
+        return float('inf')
+
+def compute_zones(station_node, graph, speed_kmh, time_limits_sec):
+    # Кэширование результатов для одной и той же станции (в памяти или Redis)
+    # Пример: можно использовать functools.lru_cache или celery task result cache
+    return get_isochrone_rings(station_node, graph, time_limits_sec, speed_kmh)
+
+def count_houses_in_zones(zones_geojson, houses_gdf):
+    from shapely.geometry import shape
+    counts = {}
+    # Оптимально: для каждой зоны выполнять spatial join или R-tree фильтр
+    for zone_name, geom in zones_geojson.items():
+        poly = shape(geom)
+        # Логика: быстро получить индексы дома внутри полигона
+        # В GeoPandas: use spatial index
+        mask = houses_gdf.geometry.within(poly)
+        counts[zone_name] = int(mask.sum())
+    return counts
+
+========================================
+
+📄 simulation.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import threading
+import time
+import random
+import networkx as nx
+import osmnx as ox
+from datetime import datetime
+import logging
+
+from database import Session, Vehicle as DBVehicle, Station as DBStation, Incident
+
+logging.basicConfig(level=logging.INFO)
+
+vehicles_dict = {}
+socketio_instance = None
+pending_incidents = []
+pending_lock = threading.Lock()
+
+
+class Vehicle:
+    def __init__(self, vid, start_node, graph, speed_kmh=100,
+                 is_temp=False, db_id=None, station_node=None, vehicle_type=None, service_time=30,
+                 inside_station=True):
+        self.id = vid
+        self.db_id = db_id or vid
+        self.graph = graph
+        self.current_node = start_node
+        self.route = []
+        self.segment = None
+        self.status = "idle"
+        self.speed_mps = speed_kmh / 3.6
+        self.is_temp = is_temp
+        self.station_node = station_node
+        self.type = vehicle_type
+        self.target_node = None
+        self.assigned_incident_id = None
+        self.patrol_timer = None
+        self.service_timer = None
+        self.service_time_sec = service_time
+        self.inside_station = inside_station
+        self.total_calls = 0
+        self.avg_response_time = 0.0
+        if not is_temp and db_id:
+            session = Session()
+            try:
+                veh_db = session.get(DBVehicle, db_id)
+                if veh_db:
+                    self.total_calls = veh_db.total_calls or 0
+                    self.avg_response_time = veh_db.avg_response_time or 0.0
+            except:
+                pass
+            finally:
+                session.close()
+
+    def update_position(self, dt=1.0):
+        if self.inside_station:
+            return
+
+        if self.segment is None:
+            if not self.route:
+                # Завершение движения
+                if self.status == "responding" and self.current_node == self.target_node:
+                    self.status = "servicing"
+                    self.update_db_status("servicing")
+                    if self.service_timer:
+                        self.service_timer.cancel()
+                    self.service_timer = threading.Timer(self.service_time_sec, self.finish_servicing)
+                    self.service_timer.daemon = True
+                    self.service_timer.start()
+                    return
+
+                if self.status == "returning" and self.current_node == self.station_node:
+                    self.inside_station = True
+                    self.status = "idle"
+                    self.update_db_status("idle")
+                    self.route = []
+                    self.segment = None
+                    logging.info(f"Vehicle {self.id} arrived at station")
+                    dispatch_pending_incidents()
+                    if socketio_instance:
+                        socketio_instance.emit('vehicle_hide', {'id': self.id})
+                    return
+
+                # Если нет маршрута, строим новый в зависимости от статуса
+                if self.status == "patrolling":
+                    self.assign_random_route()
+                    return
+                elif self.status == "moving":
+                    self.assign_random_route()
+                    return
+                else:
+                    # idle – такого не должно быть, но на всякий случай
+                    self.assign_random_route()
+                    return
+
+            # Начинаем движение по первому сегменту
+            from_node = self.current_node
+            to_node = self.route.pop(0)
+            try:
+                edge_data = self.graph[from_node][to_node]
+                if 0 in edge_data:
+                    dist = edge_data[0]['length']
+                else:
+                    dist = list(edge_data.values())[0]['length']
+            except KeyError:
+                self.segment = None
+                return
+            self.segment = (from_node, to_node, dist, 0.0)
+
+        from_node, to_node, dist, prog = self.segment
+        step = self.speed_mps * dt / dist
+        prog += step
+        if prog >= 1.0:
+            self.current_node = to_node
+            self.segment = None
+        else:
+            self.segment = (from_node, to_node, dist, prog)
+
+    def get_current_coords(self):
+        if self.inside_station:
+            return self.graph.nodes[self.station_node]['y'], self.graph.nodes[self.station_node]['x']
+        node = self.current_node
+        return self.graph.nodes[node]['y'], self.graph.nodes[node]['x']
+
+    def assign_random_route(self):
+        nodes = list(self.graph.nodes)
+        # Пытаемся найти путь к случайному узлу
+        for _ in range(10):
+            target = random.choice(nodes)
+            try:
+                path = nx.shortest_path(self.graph, self.current_node, target, weight='length')
+                if len(path) > 1:
+                    self.route = path[1:]
+                    if self.status != "patrolling":
+                        self.status = "moving"
+                        self.update_db_status("moving")
+                    logging.info(f"Vehicle {self.id} got random route, length {len(self.route)}")
+                    return
+            except:
+                continue
+        # Если не удалось – едем к соседу
+        neighbors = list(self.graph.neighbors(self.current_node))
+        if neighbors:
+            self.route = [random.choice(neighbors)]
+            if self.status != "patrolling":
+                self.status = "moving"
+                self.update_db_status("moving")
+            logging.info(f"Vehicle {self.id} using neighbor route")
+        else:
+            self.status = "idle"
+            self.update_db_status("idle")
+            logging.warning(f"Vehicle {self.id} has no neighbors")
+
+    def assign_incident(self, incident_node, incident_id, incident_type):
+        try:
+            path = nx.shortest_path(self.graph, self.current_node, incident_node, weight='length')
+            self.route = path[1:]
+            self.target_node = incident_node
+            self.status = "responding"
+            self.assigned_incident_id = incident_id
+            self.update_db_status("responding")
+            if self.inside_station:
+                self.inside_station = False
+                # Сразу сообщаем о появлении
+                if socketio_instance:
+                    lat, lon = self.get_current_coords()
+                    socketio_instance.emit('vehicle_update', {
+                        'id': self.id, 'lat': lat, 'lon': lon,
+                        'type': self.type, 'status': self.status
+                    })
+            if self.patrol_timer:
+                self.patrol_timer.cancel()
+                self.patrol_timer = None
+            if self.service_timer:
+                self.service_timer.cancel()
+                self.service_timer = None
+            if socketio_instance:
+                coords = [(self.graph.nodes[n]['y'], self.graph.nodes[n]['x']) for n in path]
+                socketio_instance.emit('route_update', {
+                    'vehicle_id': self.id,
+                    'path_coords': coords
+                })
+            return True
+        except Exception as e:
+            logging.error(f"assign_incident error: {e}")
+            return False
+
+    def finish_servicing(self):
+        self.resolve_incident()
+        if self.station_node:
+            try:
+                path = nx.shortest_path(self.graph, self.current_node, self.station_node, weight='length')
+                self.route = path[1:]
+                self.target_node = self.station_node
+                self.status = "returning"
+                self.update_db_status("returning")
+                return
+            except:
+                pass
+        self.status = "idle"
+        self.update_db_status("idle")
+        dispatch_pending_incidents()
+
+    def resolve_incident(self):
+        session = Session()
+        try:
+            incident = session.get(Incident, self.assigned_incident_id)
+            if incident and not incident.resolved:
+                incident.resolved = True
+                incident.response_time_sec = time.time() - incident.created_at.timestamp()
+                vehicle_db = session.get(DBVehicle, self.db_id)
+                if vehicle_db:
+                    vehicle_db.total_calls += 1
+                    vehicle_db.total_response_time += incident.response_time_sec
+                    vehicle_db.avg_response_time = vehicle_db.total_response_time / vehicle_db.total_calls
+                    self.total_calls = vehicle_db.total_calls
+                    self.avg_response_time = vehicle_db.avg_response_time
+                session.commit()
+                if socketio_instance:
+                    socketio_instance.emit('incident_resolved', {'incident_id': incident.id})
+        except Exception as e:
+            logging.error(e)
+            session.rollback()
+        finally:
+            session.close()
+        self.assigned_incident_id = None
+
+    def update_db_status(self, status):
+        if self.is_temp:
+            return
+        session = Session()
+        try:
+            vehicle = session.get(DBVehicle, self.db_id)
+            if vehicle:
+                vehicle.status = status
+                session.commit()
+        except:
+            session.rollback()
+        finally:
+            session.close()
+
+    def start_patrol(self, duration_sec=None):
+        if self.status not in ('idle', 'moving'):
+            return False
+        if self.patrol_timer:
+            self.patrol_timer.cancel()
+        self.status = "patrolling"
+        self.update_db_status("patrolling")
+        if self.inside_station:
+            self.inside_station = False
+            if socketio_instance:
+                lat, lon = self.get_current_coords()
+                socketio_instance.emit('vehicle_update', {
+                    'id': self.id, 'lat': lat, 'lon': lon,
+                    'type': self.type, 'status': self.status
+                })
+        if duration_sec and duration_sec > 0:
+            self.patrol_timer = threading.Timer(duration_sec, self.return_to_station)
+            self.patrol_timer.daemon = True
+            self.patrol_timer.start()
+        self.assign_random_route()
+        return True
+
+    def return_to_station(self):
+        if self.patrol_timer:
+            self.patrol_timer.cancel()
+            self.patrol_timer = None
+        if self.service_timer:
+            self.service_timer.cancel()
+            self.service_timer = None
+        if self.status in ('returning', 'responding', 'servicing'):
+            return
+        if self.inside_station:
+            return
+        try:
+            path = nx.shortest_path(self.graph, self.current_node, self.station_node, weight='length')
+            if len(path) > 1:
+                self.route = path[1:]
+                self.target_node = self.station_node
+                self.status = "returning"
+                self.update_db_status("returning")
+                logging.info(f"Vehicle {self.id} returning, {len(self.route)} edges")
+            else:
+                self.inside_station = True
+                self.status = "idle"
+                self.update_db_status("idle")
+                if socketio_instance:
+                    socketio_instance.emit('vehicle_hide', {'id': self.id})
+        except Exception as e:
+            logging.error(f"return_to_station error: {e}")
+            self.status = "idle"
+            self.update_db_status("idle")
+
+
+def get_best_vehicle_for_incident(lat, lon, typ, graph, vehicles_dict, config):
+    incident_node = ox.nearest_nodes(graph, lon, lat)
+    best_vehicle = None
+    best_time = float('inf')
+
+    for vid, v in vehicles_dict.items():
+        if v.type != typ:
+            continue
+        if v.status in ('responding', 'servicing'):
+            continue
+        start_node = v.station_node if v.inside_station else v.current_node
+        try:
+            dist = nx.shortest_path_length(graph, start_node, incident_node, weight='length')
+            travel_time = dist / (config['speed_kmh'] / 3.6)
+            if travel_time < best_time:
+                best_time = travel_time
+                best_vehicle = vid
+        except:
+            continue
+    return best_vehicle, incident_node
+
+
+def add_to_pending_incident(lat, lon, typ, incident_id):
+    with pending_lock:
+        pending_incidents.append({'id': incident_id, 'lat': lat, 'lon': lon, 'type': typ})
+    logging.info(f"Incident {incident_id} queued")
+
+
+def dispatch_pending_incidents():
+    with pending_lock:
+        if not pending_incidents:
+            return
+        incidents_to_process = list(pending_incidents)
+        pending_incidents.clear()
+    speed = 100
+    if vehicles_dict:
+        speed = next(iter(vehicles_dict.values())).speed_mps * 3.6
+    for inc in incidents_to_process:
+        vehicle_id, _ = get_best_vehicle_for_incident(
+            inc['lat'], inc['lon'], inc['type'],
+            next(iter(vehicles_dict.values())).graph if vehicles_dict else None,
+            vehicles_dict,
+            {'speed_kmh': speed}
+        )
+        if vehicle_id and vehicles_dict.get(vehicle_id):
+            v = vehicles_dict[vehicle_id]
+            node = ox.nearest_nodes(v.graph, inc['lon'], inc['lat'])
+            if v.assign_incident(node, inc['id'], inc['type']):
+                logging.info(f"Dispatched queued incident {inc['id']} to vehicle {vehicle_id}")
+                session = Session()
+                try:
+                    incident_db = session.get(Incident, inc['id'])
+                    if incident_db:
+                        incident_db.assigned_vehicle_id = vehicle_id
+                        session.commit()
+                except:
+                    session.rollback()
+                finally:
+                    session.close()
+                continue
+        with pending_lock:
+            pending_incidents.append(inc)
+
+
+def assign_incident_to_vehicle(vehicle_id, lat, lon, incident_id, typ, graph, socketio):
+    v = vehicles_dict.get(vehicle_id)
+    if not v:
+        return False
+    node = ox.nearest_nodes(graph, lon, lat)
+    return v.assign_incident(node, incident_id, typ)
+
+
+def add_vehicle(vid, start_node, graph, speed_kmh, db_id, station_node=None, vehicle_type=None, service_time=2,
+                is_temp=False, inside_station=True):
+    vehicles_dict[vid] = Vehicle(vid, start_node, graph, speed_kmh, is_temp, db_id,
+                                 station_node, vehicle_type, service_time, inside_station)
+
+
+def stop_vehicle_patrol(vid):
+    v = vehicles_dict.get(vid)
+    if v and v.patrol_timer:
+        v.patrol_timer.cancel()
+        v.patrol_timer = None
+
+
+def delete_vehicle_from_dict(vid):
+    if vid in vehicles_dict:
+        stop_vehicle_patrol(vid)
+        del vehicles_dict[vid]
+
+
+def start_simulation(socketio, data):
+    global socketio_instance
+    socketio_instance = socketio
+    graph = data.graph
+    vehicles_dict.clear()
+    session = Session()
+
+    # Сброс зависших responding
+    db_vehicles = session.query(DBVehicle).filter_by(is_temp=False).all()
+    for v in db_vehicles:
+        if v.status == 'responding':
+            incident = session.query(Incident).filter_by(assigned_vehicle_id=v.id, resolved=False).first()
+            if not incident:
+                v.status = 'idle'
+                logging.info(f"Reset stuck vehicle {v.id}")
+    session.commit()
+
+    db_vehicles = session.query(DBVehicle).filter_by(is_temp=False).all()
+    for v in db_vehicles:
+        station = v.station
+        vehicles_dict[v.id] = Vehicle(
+            v.id, station.node_id, graph, data.config['speed_kmh'],
+            is_temp=False, db_id=v.id, station_node=station.node_id,
+            vehicle_type=v.type, service_time=v.service_time or data.config['service_time_sec'],
+            inside_station=True
+        )
+    session.close()
+    logging.info(f"Loaded {len(vehicles_dict)} vehicles into simulation")
+
+    last_send = 0
+
+    def loop():
+        nonlocal last_send   # <-- ОБЯЗАТЕЛЬНО
+        while True:
+            now = time.time()
+            for v in list(vehicles_dict.values()):
+                v.update_position()
+                if not v.inside_station:
+                    lat, lon = v.get_current_coords()
+                    socketio_instance.emit('vehicle_update', {
+                        'id': v.id, 'lat': lat, 'lon': lon,
+                        'type': v.type, 'status': v.status
+                    })
+            if now - last_send > 2:
+                active = []
+                for v in vehicles_dict.values():
+                    if not v.inside_station:
+                        lat, lon = v.get_current_coords()
+                        active.append({
+                            'id': v.id, 'type': v.type, 'status': v.status,
+                            'lat': lat, 'lon': lon,
+                            'total_calls': v.total_calls,
+                            'avg_response_time': v.avg_response_time
+                        })
+                socketio_instance.emit('vehicles_list', active)
+                last_send = now
+            time.sleep(1)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+========================================
+
+📁 instance/
+------------------------------------------------------------
+
+📄 instance\export_project.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import os
+import os.path
+
+# ----- НАСТРОЙКИ -----
+TARGET_DIR = "C:\pygis\devel\olgis\city_monitor"  # Относительный путь к папке, которую нужно обработать (можно указать абсолютный)
+OUTPUT_FILE = "project_dump.txt"  # Имя итогового файла
+ENCODING = "utf-8"            # Кодировка (для русских букв в коде и тексте)
+
+# Папки, которые нужно исключить (имена или начала путей)
+IGNORE_DIRS = {".git", "export_project.py","__pycache__", "venv", ".venv", ".idea", ".pytest_cache", "node_modules", "dist", "build"}
+# Расширения текстовых файлов (если нужно только определённые; None — все файлы)
+TEXT_EXTENSIONS = {".txt", ".py", ".js", ".html", ".css", ".json", ".xml", ".yaml", ".yml", ".md", ".rst", ".ini", ".cfg", ".conf"}
+# Максимальный размер файла для чтения (байт) — слишком большие пропускаем
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 5 МБ
+# ----- КОНЕЦ НАСТРОЕК -----
+
+def should_include_file(filepath, filename):
+    """Проверяет, нужно ли включать файл."""
+    # Исключаем бинарные/ненужные файлы по расширению
+    if TEXT_EXTENSIONS is not None:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in TEXT_EXTENSIONS:
+            return False
+    # Проверяем размер
+    try:
+        size = os.path.getsize(filepath)
+        if size > MAX_FILE_SIZE:
+            return False
+    except OSError:
+        return False
+    return True
+
+def should_ignore_dir(dirpath, dirname):
+    """Исключает системные и временные папки."""
+    # Можно игнорировать по полному имени папки или по любому компоненту пути
+    if dirname in IGNORE_DIRS:
+        return True
+    # Игнорируем также .git в любом месте пути (если нужно)
+    if ".git" in dirpath.split(os.sep):
+        return True
+    return False
+
+def walk_and_write(output_handle, start_dir):
+    """Рекурсивно обходит директорию и записывает пути и содержимое файлов."""
+    start_dir = os.path.abspath(start_dir)
+    output_handle.write(f"Корневая папка: {start_dir}\n")
+    output_handle.write("=" * 80 + "\n\n")
+
+    for root, dirs, files in os.walk(start_dir):
+        # Фильтруем папки на лету (удаляем из списка обхода)
+        dirs[:] = [d for d in dirs if not should_ignore_dir(root, d)]
+
+        relative_root = os.path.relpath(root, start_dir)
+        if relative_root == ".":
+            relative_root = ""
+
+        # Выводим путь к текущей папке
+        output_handle.write(f"\n📁 {relative_root if relative_root else '[корень]'}/\n")
+        output_handle.write("-" * 60 + "\n")
+
+        for filename in sorted(files):
+            filepath = os.path.join(root, filename)
+            if not should_include_file(filepath, filename):
+                continue
+
+            relative_path = os.path.join(relative_root, filename) if relative_root else filename
+            output_handle.write(f"\n📄 {relative_path}\n")
+            output_handle.write("~" * 40 + "\n")
+
+            try:
+                with open(filepath, "r", encoding=ENCODING, errors="replace") as f:
+                    content = f.read()
+                output_handle.write(content)
+                if not content.endswith("\n"):
+                    output_handle.write("\n")
+            except Exception as e:
+                output_handle.write(f"[Ошибка чтения файла: {e}]\n")
+            output_handle.write("\n" + "=" * 40 + "\n")
+
+def main():
+    # Убедимся, что целевая директория существует
+    abs_target = os.path.abspath(TARGET_DIR)
+    if not os.path.isdir(abs_target):
+        print(f"Ошибка: директория '{abs_target}' не найдена.")
+        return
+
+    # Записываем результат
+    with open(OUTPUT_FILE, "w", encoding=ENCODING) as out:
+        walk_and_write(out, abs_target)
+
+    print(f"Готово! Результат сохранён в '{os.path.abspath(OUTPUT_FILE)}'")
+    print(f"Размер файла: {os.path.getsize(OUTPUT_FILE) / 1024:.2f} КБ")
+
+if __name__ == "__main__":
+    main()
+
+========================================
+
+📄 instance\project_dump.txt
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Корневая папка: C:\pygis\devel\olgis\city_monitor
+================================================================================
+
+
+📁 [корень]/
+------------------------------------------------------------
+
+📄 app.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+from flask import Flask, render_template, jsonify, request, current_app
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
+import osmnx as ox
+from models import DataModel
+from routing import compute_zones, count_houses_in_zones, compute_travel_time
+from simulation import start_simulation, vehicles_dict, assign_incident_to_vehicle, get_best_vehicle_for_incident, add_to_pending_incident, datetime, add_vehicle, delete_vehicle_from_dict, stop_vehicle_patrol, dispatch_pending_incidents
+from database import Session, Station as DBStation, Vehicle as DBVehicle, Incident as DBIncident
+import os
+from celery import Celery
+import logging
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+app.config['CELERY_BROKER_URL'] = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+app.config['CELERY_RESULT_BACKEND'] = app.config['CELERY_BROKER_URL']
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+def make_celery(app):
+    celery = Celery(app.import_name,
+                    broker=app.config['CELERY_BROKER_URL'],
+                    backend=app.config['CELERY_RESULT_BACKEND'])
+    celery.conf.update(app.config)
+    return celery
+
+celery = make_celery(app)
+CORS(app)
+data = DataModel()
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@socketio.on('connect')
+def on_connect():
+    print("Client connected")
+    start_simulation(socketio, data)
+
+# REST API: Дома
+@app.route('/api/houses')
+def houses():
+    return data.houses_gdf.to_json()
+
+# REST API: Станции
+@app.route('/api/stations')
+def stations():
+    session = Session()
+    db_stations = session.query(DBStation).all()
+    features = [{
+        "type": "Feature",
+        "geometry": {"type": "Point", "coordinates": [st.lon, st.lat]},
+        "properties": {"id": st.id, "name": st.name, "type": st.type}
+    } for st in db_stations]
+    session.close()
+    return jsonify({"type": "FeatureCollection", "features": features})
+
+# REST API: Дороги
+@app.route('/api/roads')
+def roads():
+    edges = ox.graph_to_gdfs(data.graph, nodes=False)[['geometry']]
+    return edges.to_json()
+
+# REST API: Зоны станции
+@app.route('/api/station/<int:sid>/zones')
+def zones(sid):
+    session = Session()
+    station = session.get(DBStation, sid)
+    session.close()
+    if not station:
+        return {"error": "station not found"}, 404
+    zones_dict = compute_zones(
+        station.node_id, data.graph,
+        data.config['speed_kmh'], data.config['time_limits_sec']
+    )
+    return jsonify(zones_dict)
+
+@app.route('/api/station/<int:sid>/house_counts')
+def station_house_counts(sid):
+    session = Session()
+    station = session.get(DBStation, sid)
+    session.close()
+    if not station:
+        return {"error": "station not found"}, 404
+    zones_dict = compute_zones(station.node_id, data.graph,
+                               data.config['speed_kmh'], data.config['time_limits_sec'])
+    counts = count_houses_in_zones(zones_dict, data.houses_gdf)
+    return jsonify(counts)
+
+@app.route('/api/vehicle_zones', methods=['POST'])
+def vehicle_zones():
+    lat = request.json.get('lat'); lon = request.json.get('lon')
+    if lat is None or lon is None:
+        return {"error": "missing lat/lon"}, 400
+    node = data.get_nearest_node(lat, lon)
+    zones_dict = compute_zones(node, data.graph,
+                               data.config['speed_kmh'], data.config['time_limits_sec'])
+    return jsonify(zones_dict)
+
+@app.route('/api/house/<int:hid>/nearest')
+def nearest(hid):
+    if hid < 0 or hid >= len(data.houses_gdf):
+        return {"error": "invalid house id"}, 404
+    house_node = data.houses_gdf.iloc[hid]['node_id']
+    session = Session()
+    stations = session.query(DBStation).all()
+    res = []
+    for st in stations:
+        t = compute_travel_time(data.graph, st.node_id, house_node, data.config['speed_kmh'])
+        res.append({"station": st.name, "eta": t})
+    session.close()
+    return jsonify(sorted(res, key=lambda x: x['eta'])[:3])
+
+# Создание ЧП (новая логика)
+@app.route('/api/incidents', methods=['POST'])
+def create_incident():
+    lat = request.json.get('lat'); lon = request.json.get('lon'); typ = request.json.get('type', 'unknown')
+    logging.info(f"Creating incident at {lat},{lon} of type {typ}")
+    session = Session()
+    vehicle_id, incident_node = get_best_vehicle_for_incident(lat, lon, typ, data.graph, vehicles_dict, data.config)
+    if vehicle_id is not None:
+        incident = DBIncident(type=typ, lat=lat, lon=lon, assigned_vehicle_id=vehicle_id)
+        session.add(incident); session.commit()
+        incident_id = incident.id
+        success = assign_incident_to_vehicle(vehicle_id, lat, lon, incident_id, typ, data.graph, socketio)
+        if success:
+            vehicle_db = session.get(DBVehicle, vehicle_id)
+            if vehicle_db:
+                vehicle_db.status = 'responding'
+                session.commit()
+            socketio.emit('incident_created', {
+                'id': incident_id, 'lat': lat, 'lon': lon,
+                'type': typ, 'vehicle_id': vehicle_id
+            })
+            session.close()
+            return jsonify({"incident_id": incident_id, "vehicle_id": vehicle_id})
+        else:
+            session.rollback()
+            session.close()
+            return jsonify({"error": "route not found"}), 500
+    else:
+        incident = DBIncident(type=typ, lat=lat, lon=lon, assigned_vehicle_id=None)
+        session.add(incident); session.commit()
+        incident_id = incident.id
+        session.close()
+        add_to_pending_incident(lat, lon, typ, incident_id)
+        dispatch_pending_incidents()
+        return jsonify({"incident_id": incident_id, "message": "queued, no vehicle available"}), 202
+
+# Создание станции
+@app.route('/api/stations', methods=['POST'])
+def create_station():
+    data_json = request.get_json()
+    name = data_json.get('name'); typ = data_json.get('type')
+    lat = data_json.get('lat'); lon = data_json.get('lon')
+    max_vehicles = data_json.get('max_vehicles', 3)
+    if not (name and typ and lat and lon):
+        return {"error": "missing fields"}, 400
+    node_id = data.get_nearest_node(lat, lon)
+    session = Session()
+    max_id = session.query(DBStation.id).order_by(DBStation.id.desc()).first()
+    new_id = (max_id[0]+1) if max_id else 1
+    station = DBStation(id=new_id, name=name, type=typ, lat=lat, lon=lon, node_id=node_id, max_vehicles=max_vehicles)
+    session.add(station); session.commit()
+    # Создаём начальные машины (не более max_vehicles)
+    for i in range(min(2, max_vehicles)):
+        vehicle = DBVehicle(
+            name=f"{typ}_{new_id}_{i+1}", type=typ, status="idle",
+            station_id=new_id, is_temp=False
+        )
+        session.add(vehicle)
+    session.commit()
+    session.close()
+    data.stations.append({"id": new_id, "name": name, "type": typ,
+                          "lat": lat, "lon": lon, "node_id": node_id, "max_vehicles": max_vehicles})
+    start_simulation(socketio, data)
+    return jsonify({"id": new_id})
+
+# ===================== АДМИНКА =====================
+@app.route('/admin')
+def admin():
+    return render_template('admin.html')
+
+@app.route('/api/admin/stations')
+def admin_stations():
+    session = Session()
+    stations = session.query(DBStation).all()
+    res = [{"id": s.id, "name": s.name, "type": s.type, "lat": s.lat, "lon": s.lon, "max_vehicles": s.max_vehicles} for s in stations]
+    session.close()
+    return jsonify(res)
+
+@app.route('/api/admin/vehicles')
+def admin_vehicles():
+    session = Session()
+    vehicles = session.query(DBVehicle).all()
+    res = []
+    for v in vehicles:
+        res.append({
+            "id": v.id, "name": v.name, "type": v.type, "status": v.status,
+            "station_name": v.station.name if v.station else None,
+            "total_calls": v.total_calls, "avg_response_time": v.avg_response_time,
+            "is_temp": v.is_temp, "service_time": v.service_time
+        })
+    session.close()
+    return jsonify(res)
+
+# Добавить машину (с проверкой лимита)
+@app.route('/api/admin/vehicles', methods=['POST'])
+def admin_add_vehicle():
+    data_req = request.json
+    station_id = data_req.get('station_id')
+    veh_type = data_req.get('type')
+    name = data_req.get('name', f"{veh_type}_auto")
+    service_time = data_req.get('service_time', 2)
+    if not station_id or not veh_type:
+        return {"error": "station_id and type required"}, 400
+    session = Session()
+    try:
+        station = session.get(DBStation, station_id)
+        if not station:
+            return {"error": "station not found"}, 404
+        current_count = session.query(DBVehicle).filter_by(station_id=station_id, is_temp=False).count()
+        if current_count >= station.max_vehicles:
+            return {"error": f"Maximum {station.max_vehicles} vehicles for this station"}, 400
+        station_node_id = station.node_id
+        new_vehicle = DBVehicle(
+            name=name, type=veh_type, status='idle',
+            station_id=station_id, is_temp=False, service_time=service_time
+        )
+        session.add(new_vehicle)
+        session.commit()
+        vehicle_id = new_vehicle.id
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    # Машина добавляется на станцию и изначально скрыта
+    add_vehicle(vehicle_id, station_node_id, data.graph,
+                data.config['speed_kmh'], vehicle_id,
+                station_node=station_node_id, vehicle_type=veh_type,
+                service_time=service_time, is_temp=False, inside_station=True)
+    logging.info(f"Vehicle {vehicle_id} added to vehicles_dict")
+    start_simulation(socketio, data)
+    return jsonify({"id": vehicle_id})
+
+# Удалить машину
+@app.route('/api/admin/vehicles/<int:vid>', methods=['DELETE'])
+def delete_vehicle(vid):
+    stop_vehicle_patrol(vid)
+    if vid in vehicles_dict:
+        del vehicles_dict[vid]
+    session = Session()
+    try:
+        session.query(DBIncident).filter_by(assigned_vehicle_id=vid).update({DBIncident.assigned_vehicle_id: None})
+        session.query(DBVehicle).filter_by(id=vid).delete()
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    start_simulation(socketio, data)
+    return jsonify({"success": True})
+
+# Редактировать машину
+@app.route('/api/admin/vehicles/<int:vid>', methods=['PUT'])
+def edit_vehicle(vid):
+    data_req = request.json
+    name = data_req.get('name')
+    service_time = data_req.get('service_time')
+    session_db = Session()
+    try:
+        vehicle = session_db.get(DBVehicle, vid)
+        if not vehicle:
+            return {"error": "vehicle not found"}, 404
+        if name:
+            vehicle.name = name
+        if service_time is not None:
+            vehicle.service_time = service_time
+            if vid in vehicles_dict:
+                vehicles_dict[vid].service_time_sec = service_time
+        session_db.commit()
+    except Exception as e:
+        session_db.rollback()
+        raise e
+    finally:
+        session_db.close()
+    return jsonify({"success": True})
+
+# Удалить станцию
+@app.route('/api/admin/stations/<int:sid>', methods=['DELETE'])
+def delete_station(sid):
+    session = Session()
+    try:
+        station = session.get(DBStation, sid)
+        if station:
+            for vid in list(vehicles_dict.keys()):
+                v = vehicles_dict.get(vid)
+                if v and hasattr(v, 'station_node') and v.station_node == station.node_id:
+                    stop_vehicle_patrol(vid)
+                    del vehicles_dict[vid]
+            for vehicle in session.query(DBVehicle).filter_by(station_id=sid):
+                session.query(DBIncident).filter_by(assigned_vehicle_id=vehicle.id).update({DBIncident.assigned_vehicle_id: None})
+            session.query(DBVehicle).filter_by(station_id=sid).delete()
+            session.delete(station)
+            session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    start_simulation(socketio, data)
+    return jsonify({"success": True})
+
+# Редактировать станцию
+@app.route('/api/admin/stations/<int:sid>', methods=['PUT'])
+def edit_station(sid):
+    data_req = request.json
+    session = Session()
+    try:
+        station = session.get(DBStation, sid)
+        if not station:
+            return {"error": "station not found"}, 404
+        if 'name' in data_req:
+            station.name = data_req['name']
+        if 'type' in data_req:
+            station.type = data_req['type']
+        if 'max_vehicles' in data_req:
+            station.max_vehicles = data_req['max_vehicles']
+        if 'lat' in data_req and 'lon' in data_req:
+            station.lat = data_req['lat']
+            station.lon = data_req['lon']
+            station.node_id = data.get_nearest_node(station.lat, station.lon)
+        session.commit()
+        # Обновляем кэш
+        data.stations = []
+        db_stations = session.query(DBStation).all()
+        for st in db_stations:
+            data.stations.append({
+                "id": st.id, "name": st.name, "type": st.type,
+                "lat": st.lat, "lon": st.lon, "node_id": st.node_id,
+                "max_vehicles": st.max_vehicles
+            })
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+    start_simulation(socketio, data)
+    return jsonify({"success": True})
+
+# Решить инцидент (админ)
+@app.route('/api/admin/incidents/<int:iid>/resolve', methods=['POST'])
+def resolve_incident_admin(iid):
+    session = Session()
+    incident = session.get(DBIncident, iid)
+    if incident and not incident.resolved:
+        incident.resolved = True
+        incident.response_time_sec = 0
+        if incident.assigned_vehicle_id:
+            vehicle = session.get(DBVehicle, incident.assigned_vehicle_id)
+            if vehicle and not vehicle.is_temp:
+                vehicle.status = 'idle'
+                session.commit()
+        session.commit()
+        socketio.emit('incident_resolved', {'incident_id': iid})
+        dispatch_pending_incidents()
+    session.close()
+    return jsonify({"success": True})
+
+# Получить нерешённые инциденты
+@app.route('/api/admin/incidents')
+def admin_incidents():
+    session = Session()
+    incidents = session.query(DBIncident).filter_by(resolved=False).all()
+    res = [{"id": i.id, "type": i.type, "lat": i.lat, "lon": i.lon,
+            "created_at": i.created_at.isoformat(), "assigned_vehicle_id": i.assigned_vehicle_id}
+           for i in incidents]
+    session.close()
+    return jsonify(res)
+
+# ===================== СТАТИСТИКА =====================
+@app.route('/api/admin/stats/incidents')
+def incident_stats():
+    session = Session()
+    from sqlalchemy import func
+    total_by_type = session.query(DBIncident.type, func.count(DBIncident.id)).filter_by(resolved=True).group_by(DBIncident.type).all()
+    avg_response_by_type = session.query(DBIncident.type, func.avg(DBIncident.response_time_sec)).filter_by(resolved=True).group_by(DBIncident.type).all()
+    stats = {
+        "total_resolved": session.query(DBIncident).filter_by(resolved=True).count(),
+        "by_type": {t: cnt for t, cnt in total_by_type},
+        "avg_response_sec_by_type": {t: float(avg or 0) for t, avg in avg_response_by_type}
+    }
+    session.close()
+    return jsonify(stats)
+
+@app.route('/api/admin/stats/vehicles')
+def vehicle_stats():
+    session = Session()
+    vehicles = session.query(DBVehicle).filter(DBVehicle.total_calls > 0).all()
+    res = []
+    for v in vehicles:
+        res.append({
+            "id": v.id,
+            "name": v.name,
+            "type": v.type,
+            "total_calls": v.total_calls,
+            "avg_response_sec": v.avg_response_time or 0,
+            "station_name": v.station.name if v.station else None
+        })
+    session.close()
+    return jsonify(res)
+
+# Патрулирование
+@app.route('/api/admin/vehicles/<int:vid>/patrol', methods=['POST'])
+def vehicle_patrol(vid):
+    data_req = request.get_json() or {}
+    duration = data_req.get('duration_sec')
+    logging.info(f"Patrol request for vehicle {vid}, vehicles_dict keys: {list(vehicles_dict.keys())}")
+    v = vehicles_dict.get(vid)
+    if not v:
+        return {"error": "vehicle not found"}, 404
+    if v.status not in ('idle', 'moving'):
+        return {"error": f"cannot patrol in status {v.status}"}, 400
+    v.start_patrol(duration)
+    return jsonify({"success": True})
+
+@app.route('/api/admin/vehicles/<int:vid>/return', methods=['POST'])
+def vehicle_return(vid):
+    v = vehicles_dict.get(vid)
+    if not v:
+        return {"error": "vehicle not found"}, 404
+    v.return_to_station()
+    return jsonify({"success": True})
+
+@socketio.on('disconnect')
+def on_disconnect():
+    print("Client disconnected")
+
+if __name__ == "__main__":
+    socketio.run(app, port=5000, debug=True)
+
+========================================
+
+📄 data_prep.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import os
+import osmnx as ox
+import geopandas as gpd
+from shapely.geometry import Point
+import json
+
+ox.settings.use_cache = True
+ox.settings.cache_folder = "./cache/osmnx"
+ox.settings.overpass_endpoint = "https://overpass-api.de/api/interpreter"
+
+os.makedirs("static/data", exist_ok=True)
+
+# Задаём ограничивающий прямоугольник (bbox)
+north, south, east, west = 56.75, 56.70, 37.20, 37.10
+
+print("Loading graph...")
+G = ox.graph_from_bbox(north, south, east, west, network_type="drive")
+ox.save_graphml(G, "static/data/graph.graphml")
+print("Graph saved.")
+
+print("Loading buildings...")
+tags = {"building": True}
+buildings = ox.features_from_bbox(north, south, east, west, tags=tags)[["geometry"]]
+buildings_proj = buildings.to_crs("EPSG:3857")
+buildings_proj["centroid"] = buildings_proj.geometry.centroid
+houses = gpd.GeoDataFrame(geometry=buildings_proj["centroid"].to_crs("EPSG:4326"))
+houses = houses.sample(min(len(houses), 1500))
+houses.to_file("static/data/houses.geojson", driver="GeoJSON")
+print(f"Houses: {len(houses)} saved.")
+
+stations = [
+    {"id": 1, "name": "Пожарная", "type": "fire", "lat": 56.734, "lon": 37.162},
+    {"id": 2, "name": "Скорая", "type": "ambulance", "lat": 56.741, "lon": 37.178},
+    {"id": 3, "name": "Полиция", "type": "police", "lat": 56.728, "lon": 37.155}
+]
+with open("static/data/stations.json", "w", encoding="utf-8") as f:
+    json.dump(stations, f, ensure_ascii=False, indent=2)
+print("Initial stations saved.")
+
+========================================
+
+📄 database.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
+
+Base = declarative_base()
+
+class Station(Base):
+    __tablename__ = 'stations'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    type = Column(String)
+    lat = Column(Float)
+    lon = Column(Float)
+    node_id = Column(Integer)
+    max_vehicles = Column(Integer, default=3)   # максимальное количество машин на станции
+    vehicles = relationship("Vehicle", back_populates="station", cascade="all, delete")
+
+class Vehicle(Base):
+    __tablename__ = 'vehicles'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    type = Column(String)
+    status = Column(String)  # idle, moving, responding, returning, servicing, patrolling
+    station_id = Column(Integer, ForeignKey('stations.id'))
+    station = relationship("Station", back_populates="vehicles")
+    total_calls = Column(Integer, default=0)
+    total_response_time = Column(Float, default=0.0)
+    avg_response_time = Column(Float, default=0.0)
+    is_temp = Column(Boolean, default=False)
+    service_time = Column(Float, default=30.0)   # время обслуживания на ЧП (сек)
+
+class Incident(Base):
+    __tablename__ = 'incidents'
+    id = Column(Integer, primary_key=True)
+    type = Column(String)
+    lat = Column(Float)
+    lon = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    assigned_vehicle_id = Column(Integer, ForeignKey('vehicles.id'))
+    response_time_sec = Column(Float, nullable=True)
+    resolved = Column(Boolean, default=False)
+
+engine = create_engine('postgresql://postgres:1109@localhost/emergency_db')
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+
+========================================
+
+📄 generate_houses.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import osmnx as ox
+import geopandas as gpd
+
+# Загружаем граф
+G = ox.load_graphml("static/data/graph.graphml")
+nodes_gdf = ox.graph_to_gdfs(G, edges=False)
+
+# Берём 500 случайных узлов графа (это будут "дома" на дорогах)
+sample_nodes = nodes_gdf.sample(min(500, len(nodes_gdf)))
+houses = gpd.GeoDataFrame(geometry=sample_nodes.geometry, crs="EPSG:4326")
+houses.to_file("static/data/houses.geojson", driver="GeoJSON")
+print(f"Создано {len(houses)} тестовых домов")
+
+========================================
+
+📄 init_db.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+from sqlalchemy import create_engine, text
+engine = create_engine('postgresql://postgres:1109@localhost/', isolation_level='AUTOCOMMIT')
+with engine.connect() as conn:
+    result = conn.execute(text("SELECT 1 FROM pg_database WHERE datname='emergency_db'"))
+    if not result.fetchone():
+        conn.execute(text("CREATE DATABASE emergency_db"))
+        print("Created database emergency_db")
+    else:
+        print("Database already exists")
+from database import Base, engine as db_engine
+Base.metadata.create_all(db_engine)
+print("Tables created.")
+
+========================================
+
+📄 models.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import osmnx as ox
+import geopandas as gpd
+import json
+from database import Session, Station as DBStation
+
+class DataModel:
+    def __init__(self):
+        print("Loading data...")
+        self.graph = ox.load_graphml("static/data/graph.graphml")
+        self.houses_gdf = gpd.read_file("static/data/houses.geojson")
+        if self.houses_gdf.crs is None:
+            self.houses_gdf.set_crs("EPSG:4326", inplace=True)
+        # Загрузка станций из БД
+        session = Session()
+        db_stations = session.query(DBStation).all()
+        self.stations = []
+        for st in db_stations:
+            self.stations.append({
+                "id": st.id, "name": st.name, "type": st.type,
+                "lat": st.lat, "lon": st.lon,
+                "node_id": st.node_id if st.node_id else self.get_nearest_node(st.lat, st.lon),
+                "max_vehicles": st.max_vehicles
+            })
+        session.close()
+        # Если станций нет (пустая БД), загрузим из JSON
+        if not self.stations:
+            with open("static/data/stations.json", encoding="utf-8") as f:
+                json_stations = json.load(f)
+            session = Session()
+            for st in json_stations:
+                node_id = self.get_nearest_node(st['lat'], st['lon'])
+                db_st = DBStation(id=st['id'], name=st['name'], type=st['type'],
+                                  lat=st['lat'], lon=st['lon'], node_id=node_id,
+                                  max_vehicles=3)
+                session.add(db_st)
+                self.stations.append({
+                    "id": st['id'], "name": st['name'], "type": st['type'],
+                    "lat": st['lat'], "lon": st['lon'], "node_id": node_id,
+                    "max_vehicles": 3
+                })
+            session.commit()
+            session.close()
+        # Скорость увеличена в 2 раза (было 50 -> 100)
+        self.config = {"speed_kmh": 100, "time_limits_sec": [300, 600, 900], "service_time_sec": 2}
+        # Привязка домов к узлам графа
+        self._attach_nodes()
+        print(f"Loaded: {len(self.houses_gdf)} houses, {len(self.stations)} stations.")
+
+    def _attach_nodes(self):
+        if self.houses_gdf.crs != "EPSG:4326":
+            self.houses_gdf = self.houses_gdf.to_crs("EPSG:4326")
+        self.houses_gdf['node_id'] = ox.nearest_nodes(
+            self.graph, X=self.houses_gdf.geometry.x, Y=self.houses_gdf.geometry.y)
+
+    def get_nearest_node(self, lat, lon):
+        return ox.nearest_nodes(self.graph, lon, lat)
+
+========================================
+
+📄 pgAdmin.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import psycopg2
+
+conn = psycopg2.connect(
+    dbname="emergency_db",
+    user="postgres",
+    password="1109",
+    host="localhost",
+    port="5432"
+)
+
+print("✅ OK")
+conn.close()
+
+========================================
+
+📄 requirements.txt
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Flask==2.3.3
+flask-cors==4.0.0
+flask-socketio==5.3.4
+eventlet==0.33.3
+osmnx==1.7.0
+networkx==2.8.8
+geopandas==0.14.0
+shapely
+openpyxl==3.1.2
+reportlab==4.0.4
+
+========================================
+
+📄 routing.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import networkx as nx
+from utils.isochrone_polygons import get_isochrone_rings
+
+def compute_travel_time(graph, from_node, to_node, speed_kmh=50):
+    try:
+        length = nx.shortest_path_length(graph, from_node, to_node, weight='length')
+        return length / (speed_kmh / 3.6)
+    except:
+        return float('inf')
+
+def compute_zones(station_node, graph, speed_kmh, time_limits_sec):
+    # Кэширование результатов для одной и той же станции (в памяти или Redis)
+    # Пример: можно использовать functools.lru_cache или celery task result cache
+    return get_isochrone_rings(station_node, graph, time_limits_sec, speed_kmh)
+
+def count_houses_in_zones(zones_geojson, houses_gdf):
+    from shapely.geometry import shape
+    counts = {}
+    # Оптимально: для каждой зоны выполнять spatial join или R-tree фильтр
+    for zone_name, geom in zones_geojson.items():
+        poly = shape(geom)
+        # Логика: быстро получить индексы дома внутри полигона
+        # В GeoPandas: use spatial index
+        mask = houses_gdf.geometry.within(poly)
+        counts[zone_name] = int(mask.sum())
+    return counts
+
+========================================
+
+📄 simulation.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import threading
+import time
+import random
+import networkx as nx
+import osmnx as ox
+from datetime import datetime
+import logging
+
+from database import Session, Vehicle as DBVehicle, Station as DBStation, Incident
+
+logging.basicConfig(level=logging.INFO)
+
+vehicles_dict = {}
+socketio_instance = None
+pending_incidents = []
+pending_lock = threading.Lock()
+
+
+class Vehicle:
+    def __init__(self, vid, start_node, graph, speed_kmh=100,
+                 is_temp=False, db_id=None, station_node=None, vehicle_type=None, service_time=30,
+                 inside_station=True):
+        self.id = vid
+        self.db_id = db_id or vid
+        self.graph = graph
+        self.current_node = start_node
+        self.route = []
+        self.segment = None
+        self.status = "idle"
+        self.speed_mps = speed_kmh / 3.6
+        self.is_temp = is_temp
+        self.station_node = station_node
+        self.type = vehicle_type
+        self.target_node = None
+        self.assigned_incident_id = None
+        self.patrol_timer = None
+        self.service_timer = None
+        self.service_time_sec = service_time
+        self.inside_station = inside_station
+        self.total_calls = 0
+        self.avg_response_time = 0.0
+        if not is_temp and db_id:
+            session = Session()
+            try:
+                veh_db = session.get(DBVehicle, db_id)
+                if veh_db:
+                    self.total_calls = veh_db.total_calls or 0
+                    self.avg_response_time = veh_db.avg_response_time or 0.0
+            except:
+                pass
+            finally:
+                session.close()
+
+    def update_position(self, dt=1.0):
+        if self.inside_station:
+            return
+
+        if self.segment is None:
+            if not self.route:
+                # Завершение движения
+                if self.status == "responding" and self.current_node == self.target_node:
+                    self.status = "servicing"
+                    self.update_db_status("servicing")
+                    if self.service_timer:
+                        self.service_timer.cancel()
+                    self.service_timer = threading.Timer(self.service_time_sec, self.finish_servicing)
+                    self.service_timer.daemon = True
+                    self.service_timer.start()
+                    return
+
+                if self.status == "returning" and self.current_node == self.station_node:
+                    self.inside_station = True
+                    self.status = "idle"
+                    self.update_db_status("idle")
+                    self.route = []
+                    self.segment = None
+                    logging.info(f"Vehicle {self.id} arrived at station")
+                    dispatch_pending_incidents()
+                    if socketio_instance:
+                        socketio_instance.emit('vehicle_hide', {'id': self.id})
+                    return
+
+                # Если нет маршрута, строим новый в зависимости от статуса
+                if self.status == "patrolling":
+                    self.assign_random_route()
+                    return
+                elif self.status == "moving":
+                    self.assign_random_route()
+                    return
+                else:
+                    # idle – такого не должно быть, но на всякий случай
+                    self.assign_random_route()
+                    return
+
+            # Начинаем движение по первому сегменту
+            from_node = self.current_node
+            to_node = self.route.pop(0)
+            try:
+                edge_data = self.graph[from_node][to_node]
+                if 0 in edge_data:
+                    dist = edge_data[0]['length']
+                else:
+                    dist = list(edge_data.values())[0]['length']
+            except KeyError:
+                self.segment = None
+                return
+            self.segment = (from_node, to_node, dist, 0.0)
+
+        from_node, to_node, dist, prog = self.segment
+        step = self.speed_mps * dt / dist
+        prog += step
+        if prog >= 1.0:
+            self.current_node = to_node
+            self.segment = None
+        else:
+            self.segment = (from_node, to_node, dist, prog)
+
+    def get_current_coords(self):
+        if self.inside_station:
+            return self.graph.nodes[self.station_node]['y'], self.graph.nodes[self.station_node]['x']
+        node = self.current_node
+        return self.graph.nodes[node]['y'], self.graph.nodes[node]['x']
+
+    def assign_random_route(self):
+        nodes = list(self.graph.nodes)
+        # Пытаемся найти путь к случайному узлу
+        for _ in range(10):
+            target = random.choice(nodes)
+            try:
+                path = nx.shortest_path(self.graph, self.current_node, target, weight='length')
+                if len(path) > 1:
+                    self.route = path[1:]
+                    if self.status != "patrolling":
+                        self.status = "moving"
+                        self.update_db_status("moving")
+                    logging.info(f"Vehicle {self.id} got random route, length {len(self.route)}")
+                    return
+            except:
+                continue
+        # Если не удалось – едем к соседу
+        neighbors = list(self.graph.neighbors(self.current_node))
+        if neighbors:
+            self.route = [random.choice(neighbors)]
+            if self.status != "patrolling":
+                self.status = "moving"
+                self.update_db_status("moving")
+            logging.info(f"Vehicle {self.id} using neighbor route")
+        else:
+            self.status = "idle"
+            self.update_db_status("idle")
+            logging.warning(f"Vehicle {self.id} has no neighbors")
+
+    def assign_incident(self, incident_node, incident_id, incident_type):
+        try:
+            path = nx.shortest_path(self.graph, self.current_node, incident_node, weight='length')
+            self.route = path[1:]
+            self.target_node = incident_node
+            self.status = "responding"
+            self.assigned_incident_id = incident_id
+            self.update_db_status("responding")
+            if self.inside_station:
+                self.inside_station = False
+                # Сразу сообщаем о появлении
+                if socketio_instance:
+                    lat, lon = self.get_current_coords()
+                    socketio_instance.emit('vehicle_update', {
+                        'id': self.id, 'lat': lat, 'lon': lon,
+                        'type': self.type, 'status': self.status
+                    })
+            if self.patrol_timer:
+                self.patrol_timer.cancel()
+                self.patrol_timer = None
+            if self.service_timer:
+                self.service_timer.cancel()
+                self.service_timer = None
+            if socketio_instance:
+                coords = [(self.graph.nodes[n]['y'], self.graph.nodes[n]['x']) for n in path]
+                socketio_instance.emit('route_update', {
+                    'vehicle_id': self.id,
+                    'path_coords': coords
+                })
+            return True
+        except Exception as e:
+            logging.error(f"assign_incident error: {e}")
+            return False
+
+    def finish_servicing(self):
+        self.resolve_incident()
+        if self.station_node:
+            try:
+                path = nx.shortest_path(self.graph, self.current_node, self.station_node, weight='length')
+                self.route = path[1:]
+                self.target_node = self.station_node
+                self.status = "returning"
+                self.update_db_status("returning")
+                return
+            except:
+                pass
+        self.status = "idle"
+        self.update_db_status("idle")
+        dispatch_pending_incidents()
+
+    def resolve_incident(self):
+        session = Session()
+        try:
+            incident = session.get(Incident, self.assigned_incident_id)
+            if incident and not incident.resolved:
+                incident.resolved = True
+                incident.response_time_sec = time.time() - incident.created_at.timestamp()
+                vehicle_db = session.get(DBVehicle, self.db_id)
+                if vehicle_db:
+                    vehicle_db.total_calls += 1
+                    vehicle_db.total_response_time += incident.response_time_sec
+                    vehicle_db.avg_response_time = vehicle_db.total_response_time / vehicle_db.total_calls
+                    self.total_calls = vehicle_db.total_calls
+                    self.avg_response_time = vehicle_db.avg_response_time
+                session.commit()
+                if socketio_instance:
+                    socketio_instance.emit('incident_resolved', {'incident_id': incident.id})
+        except Exception as e:
+            logging.error(e)
+            session.rollback()
+        finally:
+            session.close()
+        self.assigned_incident_id = None
+
+    def update_db_status(self, status):
+        if self.is_temp:
+            return
+        session = Session()
+        try:
+            vehicle = session.get(DBVehicle, self.db_id)
+            if vehicle:
+                vehicle.status = status
+                session.commit()
+        except:
+            session.rollback()
+        finally:
+            session.close()
+
+    def start_patrol(self, duration_sec=None):
+        if self.status not in ('idle', 'moving'):
+            return False
+        if self.patrol_timer:
+            self.patrol_timer.cancel()
+        self.status = "patrolling"
+        self.update_db_status("patrolling")
+        if self.inside_station:
+            self.inside_station = False
+            if socketio_instance:
+                lat, lon = self.get_current_coords()
+                socketio_instance.emit('vehicle_update', {
+                    'id': self.id, 'lat': lat, 'lon': lon,
+                    'type': self.type, 'status': self.status
+                })
+        if duration_sec and duration_sec > 0:
+            self.patrol_timer = threading.Timer(duration_sec, self.return_to_station)
+            self.patrol_timer.daemon = True
+            self.patrol_timer.start()
+        self.assign_random_route()
+        return True
+
+    def return_to_station(self):
+        if self.patrol_timer:
+            self.patrol_timer.cancel()
+            self.patrol_timer = None
+        if self.service_timer:
+            self.service_timer.cancel()
+            self.service_timer = None
+        if self.status in ('returning', 'responding', 'servicing'):
+            return
+        if self.inside_station:
+            return
+        try:
+            path = nx.shortest_path(self.graph, self.current_node, self.station_node, weight='length')
+            if len(path) > 1:
+                self.route = path[1:]
+                self.target_node = self.station_node
+                self.status = "returning"
+                self.update_db_status("returning")
+                logging.info(f"Vehicle {self.id} returning, {len(self.route)} edges")
+            else:
+                self.inside_station = True
+                self.status = "idle"
+                self.update_db_status("idle")
+                if socketio_instance:
+                    socketio_instance.emit('vehicle_hide', {'id': self.id})
+        except Exception as e:
+            logging.error(f"return_to_station error: {e}")
+            self.status = "idle"
+            self.update_db_status("idle")
+
+
+def get_best_vehicle_for_incident(lat, lon, typ, graph, vehicles_dict, config):
+    incident_node = ox.nearest_nodes(graph, lon, lat)
+    best_vehicle = None
+    best_time = float('inf')
+
+    for vid, v in vehicles_dict.items():
+        if v.type != typ:
+            continue
+        if v.status in ('responding', 'servicing'):
+            continue
+        start_node = v.station_node if v.inside_station else v.current_node
+        try:
+            dist = nx.shortest_path_length(graph, start_node, incident_node, weight='length')
+            travel_time = dist / (config['speed_kmh'] / 3.6)
+            if travel_time < best_time:
+                best_time = travel_time
+                best_vehicle = vid
+        except:
+            continue
+    return best_vehicle, incident_node
+
+
+def add_to_pending_incident(lat, lon, typ, incident_id):
+    with pending_lock:
+        pending_incidents.append({'id': incident_id, 'lat': lat, 'lon': lon, 'type': typ})
+    logging.info(f"Incident {incident_id} queued")
+
+
+def dispatch_pending_incidents():
+    with pending_lock:
+        if not pending_incidents:
+            return
+        incidents_to_process = list(pending_incidents)
+        pending_incidents.clear()
+    speed = 100
+    if vehicles_dict:
+        speed = next(iter(vehicles_dict.values())).speed_mps * 3.6
+    for inc in incidents_to_process:
+        vehicle_id, _ = get_best_vehicle_for_incident(
+            inc['lat'], inc['lon'], inc['type'],
+            next(iter(vehicles_dict.values())).graph if vehicles_dict else None,
+            vehicles_dict,
+            {'speed_kmh': speed}
+        )
+        if vehicle_id and vehicles_dict.get(vehicle_id):
+            v = vehicles_dict[vehicle_id]
+            node = ox.nearest_nodes(v.graph, inc['lon'], inc['lat'])
+            if v.assign_incident(node, inc['id'], inc['type']):
+                logging.info(f"Dispatched queued incident {inc['id']} to vehicle {vehicle_id}")
+                session = Session()
+                try:
+                    incident_db = session.get(Incident, inc['id'])
+                    if incident_db:
+                        incident_db.assigned_vehicle_id = vehicle_id
+                        session.commit()
+                except:
+                    session.rollback()
+                finally:
+                    session.close()
+                continue
+        with pending_lock:
+            pending_incidents.append(inc)
+
+
+def assign_incident_to_vehicle(vehicle_id, lat, lon, incident_id, typ, graph, socketio):
+    v = vehicles_dict.get(vehicle_id)
+    if not v:
+        return False
+    node = ox.nearest_nodes(graph, lon, lat)
+    return v.assign_incident(node, incident_id, typ)
+
+
+def add_vehicle(vid, start_node, graph, speed_kmh, db_id, station_node=None, vehicle_type=None, service_time=2,
+                is_temp=False, inside_station=True):
+    vehicles_dict[vid] = Vehicle(vid, start_node, graph, speed_kmh, is_temp, db_id,
+                                 station_node, vehicle_type, service_time, inside_station)
+
+
+def stop_vehicle_patrol(vid):
+    v = vehicles_dict.get(vid)
+    if v and v.patrol_timer:
+        v.patrol_timer.cancel()
+        v.patrol_timer = None
+
+
+def delete_vehicle_from_dict(vid):
+    if vid in vehicles_dict:
+        stop_vehicle_patrol(vid)
+        del vehicles_dict[vid]
+
+
+def start_simulation(socketio, data):
+    global socketio_instance
+    socketio_instance = socketio
+    graph = data.graph
+    vehicles_dict.clear()
+    session = Session()
+
+    # Сброс зависших responding
+    db_vehicles = session.query(DBVehicle).filter_by(is_temp=False).all()
+    for v in db_vehicles:
+        if v.status == 'responding':
+            incident = session.query(Incident).filter_by(assigned_vehicle_id=v.id, resolved=False).first()
+            if not incident:
+                v.status = 'idle'
+                logging.info(f"Reset stuck vehicle {v.id}")
+    session.commit()
+
+    db_vehicles = session.query(DBVehicle).filter_by(is_temp=False).all()
+    for v in db_vehicles:
+        station = v.station
+        vehicles_dict[v.id] = Vehicle(
+            v.id, station.node_id, graph, data.config['speed_kmh'],
+            is_temp=False, db_id=v.id, station_node=station.node_id,
+            vehicle_type=v.type, service_time=v.service_time or data.config['service_time_sec'],
+            inside_station=True
+        )
+    session.close()
+    logging.info(f"Loaded {len(vehicles_dict)} vehicles into simulation")
+
+    last_send = 0
+
+    def loop():
+        nonlocal last_send   # <-- ОБЯЗАТЕЛЬНО
+        while True:
+            now = time.time()
+            for v in list(vehicles_dict.values()):
+                v.update_position()
+                if not v.inside_station:
+                    lat, lon = v.get_current_coords()
+                    socketio_instance.emit('vehicle_update', {
+                        'id': v.id, 'lat': lat, 'lon': lon,
+                        'type': v.type, 'status': v.status
+                    })
+            if now - last_send > 2:
+                active = []
+                for v in vehicles_dict.values():
+                    if not v.inside_station:
+                        lat, lon = v.get_current_coords()
+                        active.append({
+                            'id': v.id, 'type': v.type, 'status': v.status,
+                            'lat': lat, 'lon': lon,
+                            'total_calls': v.total_calls,
+                            'avg_response_time': v.avg_response_time
+                        })
+                socketio_instance.emit('vehicles_list', active)
+                last_send = now
+            time.sleep(1)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+========================================
+
+📁 static/
+------------------------------------------------------------
+
+📁 static\css/
+------------------------------------------------------------
+
+📄 static\css\style.css
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+body {
+    margin: 0;
+    padding: 0;
+    font-family: Arial, sans-serif;
+}
+#info-panel { font-size: 14px; }
+#info-panel details { margin-bottom: 8px; }
+#info-panel ul { margin: 0; padding-left: 20px; }
+.leaflet-div-icon { background: transparent; border: none; }
+button {
+    background-color: #3498db;
+    border: none;
+    color: white;
+    border-radius: 4px;
+    font-size: 12px;
+    margin-top: 4px;
+    padding: 4px 8px;
+    width: 100%;
+    cursor: pointer;
+}
+button:hover { background-color: #2980b9; }
+#legend {
+    font-size: 14px;
+    min-width: 140px;   /* Уменьшили ширину */
+    max-width: 160px;
+}
+.incident-marker {
+    opacity: 0.9;
+}
+
+========================================
+
+📁 static\data/
+------------------------------------------------------------
+
+📁 static\js/
+------------------------------------------------------------
+
+📄 static\js\main.js
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Инициализация карты
+const map = L.map('map').setView([56.73, 37.17], 13);
+const vehicles = {};
+let currentZonesLayer = null, allZonesLayer = null, selectedStationMarker = null, routeLayer = null;
+const socket = io();
+
+function getVehicleIcon(type) {
+    const symbols = {fire: '🚒', ambulance: '🚑', police: '🚓'};
+    const symbol = symbols[type] || '🚗';
+    return L.divIcon({ html: symbol, iconSize: [28, 28], className: 'leaflet-div-icon' });
+}
+
+// ЕДИНСТВЕННЫЙ обработчик обновления позиции машины
+socket.on('vehicle_update', v => {
+    if (!vehicles[v.id]) {
+        const marker = L.marker([v.lat, v.lon], {icon: getVehicleIcon(v.type)}).addTo(map);
+        marker.on('click', async () => {
+            const res = await fetch('/api/vehicle_zones', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({lat: v.lat, lon: v.lon})
+            });
+            const zones = await res.json();
+            showZones(zones, true);
+        });
+        vehicles[v.id] = marker;
+    } else {
+        animateMarker(vehicles[v.id], [v.lat, v.lon]);
+    }
+});
+
+// Хранилище маркеров ЧП
+const incidentMarkers = {};
+
+function animateMarker(marker, newLatLng, duration = 1000) {
+    const start = marker.getLatLng();
+    const end = L.latLng(newLatLng);
+    const startTime = performance.now();
+    function animate(time) {
+        const t = Math.min((time - startTime) / duration, 1);
+        const lat = start.lat + (end.lat - start.lat) * t;
+        const lng = start.lng + (end.lng - start.lng) * t;
+        marker.setLatLng([lat, lng]);
+        if (t < 1) requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+}
+
+function getStationIcon(type, isHighlighted=false) {
+    const symbols = {fire: '🔥', ambulance: '🚑', police: '👮'};
+    const symbol = symbols[type] || '📍';
+    const fontSize = isHighlighted ? '36px' : '28px';
+    const shadow = isHighlighted ? '0 0 0 3px yellow, 1px 1px 2px black' : '1px 1px 1px white';
+    return L.divIcon({
+        html: `<div style="font-size:${fontSize}; text-shadow:${shadow};">${symbol}</div>`,
+        iconSize: [isHighlighted?44:36, isHighlighted?44:36],
+        className: `station-icon-${type}`,
+        popupAnchor: [0, -18]
+    });
+}
+
+// Приём инцидента
+socket.on('incident_created', incident => {
+    console.log('Received incident', incident);
+    const incIcon = L.divIcon({html: '🚨', iconSize:[32,32], className:'incident-marker'});
+    const marker = L.marker([incident.lat, incident.lon], {icon: incIcon}).addTo(map);
+    marker.bindPopup(`<b>ЧП #${incident.id}</b><br>Тип: ${incident.type}<br>Машина: ${incident.vehicle_id}`).openPopup();
+    incidentMarkers[incident.id] = marker;
+});
+
+// Устранение инцидента
+socket.on('incident_resolved', data => {
+    const marker = incidentMarkers[data.incident_id];
+    if (marker) {
+        map.removeLayer(marker);
+        delete incidentMarkers[data.incident_id];
+    }
+});
+
+// Карта и тайлы
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+function showZones(zones, replace=true) {
+    const order = ["0-5 мин", "5-10 мин", "10-15 мин"];
+    const styles = {
+        "0-5 мин": { color:"#2ecc71", fillColor:"#2ecc71", fillOpacity:0.5, weight:2, opacity:0.8 },
+        "5-10 мин": { color:"#f39c12", fillColor:"#f39c12", fillOpacity:0.4, weight:2, opacity:0.8 },
+        "10-15 мин": { color:"#e74c3c", fillColor:"#e74c3c", fillOpacity:0.3, weight:2, opacity:0.8 }
+    };
+    if (replace) {
+        if (currentZonesLayer) map.removeLayer(currentZonesLayer);
+        currentZonesLayer = L.layerGroup().addTo(map);
+    } else {
+        if (!allZonesLayer) allZonesLayer = L.layerGroup().addTo(map);
+    }
+    const target = replace ? currentZonesLayer : allZonesLayer;
+    order.forEach(zone => {
+        const poly = zones[zone];
+        if (poly) {
+            const layer = L.geoJSON(poly, {style: styles[zone]});
+            layer.addTo(target);
+            if (replace && zone==="0-5 мин") try { map.fitBounds(layer.getBounds()); } catch(e){}
+        }
+    });
+}
+
+async function showStationStats(stationId, marker, stationType) {
+    if (selectedStationMarker) {
+        const prevType = selectedStationMarker.feature.properties.type;
+        selectedStationMarker.setIcon(getStationIcon(prevType, false));
+    }
+    selectedStationMarker = marker;
+    marker.setIcon(getStationIcon(stationType, true));
+    const res = await fetch(`/api/station/${stationId}/house_counts`);
+    const counts = await res.json();
+    let html = `<b>${marker.feature.properties.name}</b><br>Дома в зонах:<br>`;
+    for (let [zone, count] of Object.entries(counts)) {
+        html += `${zone}: ${count} шт.<br>`;
+    }
+    marker.bindPopup(html).openPopup();
+}
+
+socket.on('route_update', data => {
+    if (routeLayer) map.removeLayer(routeLayer);
+    routeLayer = L.polyline(data.path_coords, { color:'red', weight:5, opacity:0.8 }).addTo(map);
+    setTimeout(() => { if (routeLayer) map.removeLayer(routeLayer); }, 10000);
+});
+
+// Загрузка дорог, домов, станций
+fetch('/api/roads').then(r => r.json()).then(data => {
+    L.geoJSON(data, { style: {color:"#3498db", weight:2, opacity:0.6} }).addTo(map);
+});
+fetch('/api/houses').then(r => r.json()).then(data => {
+    L.geoJSON(data, {
+        pointToLayer: (f, ll) => L.circleMarker(ll, {
+            radius: 3, color:"#2c3e50", fillColor:"#95a5a6",
+            fillOpacity: 0.7, weight: 1
+        })
+    }).addTo(map);
+});
+fetch('/api/stations').then(r => r.json()).then(geojson => {
+    L.geoJSON(geojson, {
+        pointToLayer: (feature, latlng) => {
+            return L.marker(latlng, { icon: getStationIcon(feature.properties.type, false) });
+        },
+        onEachFeature: (feature, layer) => {
+            layer.feature = feature;
+            layer.bindPopup(`<b>${feature.properties.name}</b><br>Тип: ${feature.properties.type}`);
+            layer.on('click', async () => {
+                const sid = feature.properties.id;
+                const res = await fetch(`/api/station/${sid}/zones`);
+                const zones = await res.json();
+                showZones(zones, true);
+                showStationStats(sid, layer, feature.properties.type);
+            });
+        }
+    }).addTo(map);
+});
+
+// Легенда и кнопки (ссылка на админку добавлена в HTML)
+const legendDiv = document.getElementById('legend');
+if (legendDiv) {
+    const btnAll = document.createElement('button');
+    btnAll.textContent = '📊 Показать все изохроны';
+    btnAll.onclick = async () => {
+        if (allZonesLayer) map.removeLayer(allZonesLayer);
+        allZonesLayer = L.layerGroup().addTo(map);
+        const stationsRes = await fetch('/api/stations');
+        const stationsJson = await stationsRes.json();
+        for (const feat of stationsJson.features) {
+            const zonesRes = await fetch(`/api/station/${feat.properties.id}/zones`);
+            const zones = await zonesRes.json();
+            showZones(zones, false);
+        }
+    };
+    legendDiv.appendChild(btnAll);
+
+    const clearBtn = document.createElement('button');
+    clearBtn.textContent = '🗑️ Очистить изохроны';
+    clearBtn.onclick = () => {
+        if (currentZonesLayer) map.removeLayer(currentZonesLayer);
+        if (allZonesLayer) map.removeLayer(allZonesLayer);
+        currentZonesLayer = allZonesLayer = null;
+    };
+    legendDiv.appendChild(clearBtn);
+
+    const incidentBtn = document.createElement('button');
+    incidentBtn.textContent = '🚨 Новое ЧП';
+    incidentBtn.onclick = () => {
+        map.once('click', async e => {
+            let type = prompt("Тип ЧП (fire/ambulance/police):");
+            if (!type) return;
+            try {
+                const res = await fetch('/api/incidents', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({lat: e.latlng.lat, lon: e.latlng.lng, type})
+                });
+                const data = await res.json();
+                if (!res.ok) { alert(`Ошибка: ${data.error||'неизвестная'}`); return; }
+                alert(`ЧП создано, отправлена машина ${data.vehicle_id}`);
+            } catch(err) {
+                alert(`Ошибка соединения: ${err.message}`);
+            }
+        });
+    };
+    legendDiv.appendChild(incidentBtn);
+
+    const stationBtn = document.createElement('button');
+    stationBtn.textContent = '➕ Новая станция';
+    stationBtn.onclick = () => {
+        map.once('click', async e => {
+            let name = prompt("Название станции:");
+            let type = prompt("Тип станции (fire/ambulance/police):");
+            if (!name || !type) return;
+            const res = await fetch('/api/stations', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name, type, lat: e.latlng.lat, lon: e.latlng.lng})
+            });
+            if (res.ok) { alert('Станция добавлена'); location.reload(); }
+            else alert("Ошибка создания станции");
+        });
+    };
+    legendDiv.appendChild(stationBtn);
+}
+
+// Панель активных машин
+const vehiclesListDiv = document.getElementById('vehicles-list');
+if (vehiclesListDiv) {
+    socket.on('vehicles_list', (activeVehicles) => {
+        vehiclesListDiv.innerHTML = '';
+        if (activeVehicles.length === 0) {
+            vehiclesListDiv.innerHTML = '<i>Нет активных машин</i>';
+            return;
+        }
+        activeVehicles.forEach(v => {
+            const div = document.createElement('div');
+            div.style.marginBottom = '8px';
+            div.style.padding = '4px';
+            div.style.borderBottom = '1px solid #ddd';
+            div.style.cursor = 'pointer';
+            div.style.borderRadius = '4px';
+            div.onmouseover = () => div.style.backgroundColor = '#f0f0f0';
+            div.onmouseout = () => div.style.backgroundColor = 'transparent';
+            const symbols = {fire:'🚒', ambulance:'🚑', police:'🚓'};
+            const symbol = symbols[v.type] || '🚗';
+            div.innerHTML = `<strong>${symbol} ${v.id}</strong><br>Статус: ${v.status}<br>📞 ${v.total_calls} вызовов, ⏱ ${(v.avg_response_time || 0).toFixed(1)}с`;
+            div.onclick = () => {
+                map.setView([v.lat, v.lon], 16);
+                if (vehicles[v.id]) vehicles[v.id].openPopup();
+            };
+            vehiclesListDiv.appendChild(div);
+        });
+    });
+}
+
+// Скрытие машины при возврате на станцию
+socket.on('vehicle_hide', (data) => {
+    if (vehicles[data.id]) {
+        map.removeLayer(vehicles[data.id]);
+        delete vehicles[data.id];
+    }
+});
+
+========================================
+
+📁 templates/
+------------------------------------------------------------
+
+📄 templates\admin.html
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Панель администратора</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .nav { margin-bottom: 20px; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        button { margin: 2px; padding: 4px 8px; cursor: pointer; }
+        .stats-block { background: #f9f9f9; padding: 10px; margin-bottom: 20px; border-radius: 5px; }
+        .form-popup {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            border: 2px solid #ccc;
+            padding: 20px;
+            z-index: 1000;
+            box-shadow: 0 0 15px rgba(0,0,0,0.3);
+        }
+        .form-popup input, .form-popup select { margin: 5px 0; width: 100%; }
+    </style>
+</head>
+<body>
+<div class="nav">
+    <a href="/">Карта</a> | <a href="/admin">Админ панель</a>
+</div>
+<h1>Админпанель</h1>
+
+<div class="stats-block">
+    <h2>Статистика решённых инцидентов</h2>
+    <div id="incident-stats">Загрузка...</div>
+</div>
+
+<div class="stats-block">
+    <h2>Статистика по машинам</h2>
+    <div id="vehicle-stats">Загрузка...</div>
+</div>
+
+<h2>Станции</h2>
+<button onclick="showAddStationForm()">➕ Добавить станцию</button>
+<div id="station-form" class="form-popup">
+    <h3>Новая станция</h3>
+    <input id="station-name" placeholder="Название"><br>
+    <input id="station-type" placeholder="Тип (fire/ambulance/police)"><br>
+    <input id="station-lat" placeholder="Широта"><br>
+    <input id="station-lon" placeholder="Долгота"><br>
+    <input id="station-maxveh" placeholder="Макс. машин" value="3"><br>
+    <button onclick="addStation()">Сохранить</button>
+    <button onclick="hideAddStationForm()">Отмена</button>
+</div>
+<table id="stations-table">
+    <thead><tr><th>ID</th><th>Название</th><th>Тип</th><th>Координаты</th><th>Макс. машин</th><th>Действия</th></tr></thead>
+    <tbody></tbody>
+</table>
+
+<h2>Машины</h2>
+<div>
+    <h3>Добавить машину</h3>
+    <select id="add-vehicle-station"></select>
+    <input id="add-vehicle-type" placeholder="Тип (fire/ambulance/police)">
+    <input id="add-vehicle-name" placeholder="Название (опционально)">
+    <input id="add-vehicle-service" placeholder="Время обслуж. (сек)" value="2">
+    <button onclick="addVehicle()">➕ Добавить машину</button>
+</div>
+<table id="vehicles-table">
+    <thead><tr><th>ID</th><th>Название</th><th>Тип</th><th>Статус</th><th>Станция</th><th>Вызовов</th><th>Ср.время (с)</th><th>Время обслуж.</th><th>Действия</th></tr></thead>
+    <tbody></tbody>
+</table>
+
+<h2>ЧП (нерешённые)</h2>
+<table id="incidents-table">
+    <thead><tr><th>ID</th><th>Тип</th><th>Координаты</th><th>Создано</th><th>Машина</th><th>Действия</th></tr></thead>
+    <tbody></tbody>
+</table>
+
+<script>
+async function loadData() {
+    // Загрузка станций
+    const stationsRes = await fetch('/api/admin/stations');
+    const stations = await stationsRes.json();
+    const stationSelect = document.getElementById('add-vehicle-station');
+    stationSelect.innerHTML = '<option value="">Выберите станцию</option>';
+    const stationsTbody = document.querySelector('#stations-table tbody');
+    stationsTbody.innerHTML = '';
+    stations.forEach(st => {
+        const opt = document.createElement('option');
+        opt.value = st.id;
+        opt.textContent = `${st.name} (${st.type})`;
+        stationSelect.appendChild(opt);
+
+        const row = stationsTbody.insertRow();
+        row.insertCell(0).textContent = st.id;
+        row.insertCell(1).textContent = st.name;
+        row.insertCell(2).textContent = st.type;
+        row.insertCell(3).textContent = `${st.lat}, ${st.lon}`;
+        row.insertCell(4).textContent = st.max_vehicles;
+        const actions = row.insertCell(5);
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '✏️';
+        editBtn.onclick = () => editStation(st.id);
+        actions.appendChild(editBtn);
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑';
+        delBtn.onclick = () => deleteStation(st.id);
+        actions.appendChild(delBtn);
+    });
+
+    // Загрузка машин
+    const vehiclesRes = await fetch('/api/admin/vehicles');
+    const vehicles = await vehiclesRes.json();
+    const vehiclesTbody = document.querySelector('#vehicles-table tbody');
+    vehiclesTbody.innerHTML = '';
+   vehicles.forEach(v => {
+    const row = vehiclesTbody.insertRow();
+    row.insertCell(0).textContent = v.id;
+    row.insertCell(1).textContent = v.name;
+    row.insertCell(2).textContent = v.type;
+    row.insertCell(3).textContent = v.status;
+    row.insertCell(4).textContent = v.station_name || '—';
+    row.insertCell(5).textContent = v.total_calls;
+    row.insertCell(6).textContent = v.avg_response_time ? v.avg_response_time.toFixed(1) : '—';
+    row.insertCell(7).textContent = (v.service_time || 2) + ' с';
+    const actions = row.insertCell(8);
+
+    // Кнопка редактирования (всегда)
+    const editBtn = document.createElement('button');
+    editBtn.textContent = '✏️';
+    editBtn.onclick = () => editVehicle(v.id);
+    actions.appendChild(editBtn);
+
+    // Кнопка удаления (для всех, кроме временных)
+
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑 Удалить';
+        delBtn.onclick = () => deleteVehicle(v.id);
+        actions.appendChild(delBtn);
+
+
+    // Кнопки управления: патруль и возврат – только если статус НЕ responding
+    if (v.status !== 'responding') {
+        const patrolBtn = document.createElement('button');
+        patrolBtn.textContent = '🚓 Патруль';
+        patrolBtn.onclick = () => startPatrol(v.id);
+        actions.appendChild(patrolBtn);
+
+        const returnBtn = document.createElement('button');
+        returnBtn.textContent = '🏠 Вернуть';
+        returnBtn.onclick = () => returnToStation(v.id);
+        actions.appendChild(returnBtn);
+    }
+});
+
+    // Загрузка инцидентов
+    const incidentsRes = await fetch('/api/admin/incidents');
+    const incidents = await incidentsRes.json();
+    const incidentsTbody = document.querySelector('#incidents-table tbody');
+    incidentsTbody.innerHTML = '';
+    incidents.forEach(inc => {
+        const row = incidentsTbody.insertRow();
+        row.insertCell(0).textContent = inc.id;
+        row.insertCell(1).textContent = inc.type;
+        row.insertCell(2).textContent = `${inc.lat}, ${inc.lon}`;
+        row.insertCell(3).textContent = new Date(inc.created_at).toLocaleString();
+        row.insertCell(4).textContent = inc.assigned_vehicle_id || '—';
+        const actions = row.insertCell(5);
+        const resBtn = document.createElement('button');
+        resBtn.textContent = 'Решить';
+        resBtn.onclick = () => resolveIncident(inc.id);
+        actions.appendChild(resBtn);
+    });
+
+    // Статистика инцидентов
+    const statsInc = await fetch('/api/admin/stats/incidents');
+    const statsIncData = await statsInc.json();
+    const statsDiv = document.getElementById('incident-stats');
+    statsDiv.innerHTML = `<strong>Всего решено:</strong> ${statsIncData.total_resolved}<br>
+                          <strong>По типам:</strong><br>`;
+    for (const [typ, cnt] of Object.entries(statsIncData.by_type)) {
+        const avg = statsIncData.avg_response_sec_by_type[typ] || 0;
+        statsDiv.innerHTML += `${typ}: ${cnt} (ср. время ответа: ${avg.toFixed(1)} с)<br>`;
+    }
+
+    // Статистика машин
+    const statsVeh = await fetch('/api/admin/stats/vehicles');
+    const vehiclesStats = await statsVeh.json();
+    const vehStatsDiv = document.getElementById('vehicle-stats');
+    vehStatsDiv.innerHTML = '<table border="1" cellpadding="5"><tr><th>ID</th><th>Имя</th><th>Тип</th><th>Вызовов</th><th>Ср. время (с)</th><th>Станция</th></tr>';
+    vehiclesStats.forEach(vs => {
+        vehStatsDiv.innerHTML += `<tr><td>${vs.id}</td><td>${vs.name}</td><td>${vs.type}</td><td>${vs.total_calls}</td><td>${vs.avg_response_sec.toFixed(1)}</td><td>${vs.station_name || '—'}</td></tr>`;
+    });
+    vehStatsDiv.innerHTML += '</table>';
+}
+
+function showAddStationForm() { document.getElementById('station-form').style.display = 'block'; }
+function hideAddStationForm() { document.getElementById('station-form').style.display = 'none'; }
+
+async function addStation() {
+    const name = document.getElementById('station-name').value;
+    const type = document.getElementById('station-type').value;
+    const lat = parseFloat(document.getElementById('station-lat').value);
+    const lon = parseFloat(document.getElementById('station-lon').value);
+    const maxVehicles = parseInt(document.getElementById('station-maxveh').value) || 3;
+    if (!name || !type || isNaN(lat) || isNaN(lon)) { alert('Заполните все поля'); return; }
+    const res = await fetch('/api/stations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, type, lat, lon, max_vehicles: maxVehicles })
+    });
+    if (res.ok) { alert('Станция добавлена'); location.reload(); } else alert('Ошибка при добавлении');
+}
+
+async function deleteStation(id) {
+    if (confirm('Удалить станцию?')) {
+        const res = await fetch(`/api/admin/stations/${id}`, { method: 'DELETE' });
+        if (res.ok) loadData(); else alert('Ошибка удаления');
+    }
+}
+
+async function editStation(id) {
+    const newName = prompt("Новое название:", "");
+    const newType = prompt("Новый тип (fire/ambulance/police):", "");
+    const newLat = parseFloat(prompt("Широта:", ""));
+    const newLon = parseFloat(prompt("Долгота:", ""));
+    const newMax = parseInt(prompt("Максимум машин:", ""));
+    const payload = {};
+    if (newName) payload.name = newName;
+    if (newType) payload.type = newType;
+    if (!isNaN(newLat)) payload.lat = newLat;
+    if (!isNaN(newLon)) payload.lon = newLon;
+    if (!isNaN(newMax)) payload.max_vehicles = newMax;
+    const res = await fetch(`/api/admin/stations/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    if (res.ok) loadData(); else alert('Ошибка');
+}
+
+async function addVehicle() {
+    const stationId = document.getElementById('add-vehicle-station').value;
+    const type = document.getElementById('add-vehicle-type').value;
+    const name = document.getElementById('add-vehicle-name').value;
+    const serviceTime = parseFloat(document.getElementById('add-vehicle-service').value) || 2;
+    if (!stationId || !type) return alert('Выберите станцию и тип');
+    const res = await fetch('/api/admin/vehicles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ station_id: stationId, type, name, service_time: serviceTime })
+    });
+    if (res.ok) loadData(); else alert('Ошибка добавления');
+}
+
+async function deleteVehicle(id) {
+    if (confirm('Удалить машину?')) {
+        const res = await fetch(`/api/admin/vehicles/${id}`, { method: 'DELETE' });
+        if (res.ok) loadData(); else alert('Ошибка удаления');
+    }
+}
+
+async function editVehicle(id) {
+    const newName = prompt("Новое имя машины:", "");
+    const newService = parseFloat(prompt("Время обслуживания (сек):", ""));
+    const payload = {};
+    if (newName) payload.name = newName;
+    if (!isNaN(newService)) payload.service_time = newService;
+    const res = await fetch(`/api/admin/vehicles/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    if (res.ok) loadData(); else alert('Ошибка');
+}
+
+async function resolveIncident(id) {
+    if (confirm('Отметить инцидент как решённый?')) {
+        const res = await fetch(`/api/admin/incidents/${id}/resolve`, { method: 'POST' });
+        if (res.ok) loadData(); else alert('Ошибка обновления');
+    }
+}
+
+async function startPatrol(vid) {
+    let duration = prompt('Длительность патруля в секундах (0 – до команды "Вернуть"):', '0');
+    if (duration === null) return;
+    duration = parseInt(duration);
+    const res = await fetch(`/api/admin/vehicles/${vid}/patrol`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ duration_sec: duration > 0 ? duration : null })
+    });
+    if (res.ok) loadData(); else alert('Ошибка');
+}
+
+async function returnToStation(vid) {
+    const res = await fetch(`/api/admin/vehicles/${vid}/return`, { method: 'POST' });
+    if (res.ok) loadData(); else alert('Ошибка');
+}
+
+loadData();
+setInterval(loadData, 5000);
+</script>
+</body>
+</html>
+
+========================================
+
+📄 templates\index.html
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>САМГТ-ЭС - Мониторинг транспорта</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="map" style="height:100vh;"></div>
+
+    <!-- Панель загрузки GeoJSON -->
+    <div id="upload-panel" style="position:absolute; bottom:20px; left:20px;
+                                background:white; padding:10px; border-radius:8px;
+                                z-index:1000; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+        <label>📁 Дороги (GeoJSON):</label>
+        <input type="file" id="roads-file" accept=".geojson"><br>
+        <label>🏢 Здания (GeoJSON):</label>
+        <input type="file" id="buildings-file" accept=".geojson">
+    </div>
+
+    <!-- Легенда и ссылка на админку -->
+    <div id="legend" style="position:absolute; top:20px; right:20px;
+                            background:white; padding:10px; border-radius:8px;
+                            z-index:1000; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+        <strong>Легенда</strong><br>
+        <span style="font-size:24px;">🚗</span> Машина<br>
+        <span style="font-size:24px;">🔥</span> Пожарная станция<br>
+        <span style="font-size:24px;">🚑</span> Скорая станция<br>
+        <span style="font-size:24px;">👮</span> Полицейская станция<br>
+        <div style="margin-top:8px;">
+            <div style="display:inline-block; width:14px; height:14px; background:#2ecc71"></div> 5 мин<br>
+            <div style="display:inline-block; width:14px; height:14px; background:#f39c12"></div> 10 мин<br>
+            <div style="display:inline-block; width:14px; height:14px; background:#e74c3c"></div> 15 мин
+        </div>
+        <hr>
+        <a href="/admin" target="_blank" style="display:block; text-align:center;">🔧 Админ-панель</a>
+    </div>
+<div id="vehicles-panel" style="position:absolute; top:20px; left:20px;
+    background:white; padding:10px; border-radius:8px; z-index:1000;
+    width:260px; max-height:300px; overflow-y:auto; box-shadow:0 2px 8px rgba(0,0,0,0.2); font-size:12px;">
+    <strong>🚗 Активные машины</strong>
+    <div id="vehicles-list" style="margin-top:5px;"></div>
+</div>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
+
+========================================
+
+📁 utils/
+------------------------------------------------------------
+
+📄 utils\isochrone_polygons.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+import networkx as nx
+import geopandas as gpd
+from shapely.geometry import Point, LineString
+from shapely.ops import unary_union
+
+# Глобальный кэш
+ISOCHRONE_CACHE = {}
+
+def get_isochrone_rings(station_node, graph, time_limits_sec, speed_kmh):
+    import geopandas as gpd
+    from shapely.geometry import Point, LineString
+    from shapely.ops import unary_union
+    import networkx as nx
+
+    speed_ms = speed_kmh / 3.6
+    zones = {}
+
+    # Считаем расстояния один раз
+    dist_dict = nx.single_source_dijkstra_path_length(
+        graph, station_node, weight='length'
+    )
+
+    prev_poly = None
+
+    for t_sec in sorted(time_limits_sec):
+        max_dist = t_sec * speed_ms
+
+        # Узлы в пределах времени
+        nodes = {n for n, d in dist_dict.items() if d <= max_dist}
+        if len(nodes) < 2:
+            continue
+
+        # Собираем линии
+        lines = []
+        for u, v in graph.edges():
+            if u in nodes and v in nodes:
+                lines.append(LineString([
+                    (graph.nodes[u]['x'], graph.nodes[u]['y']),
+                    (graph.nodes[v]['x'], graph.nodes[v]['y'])
+                ]))
+
+        if not lines:
+            continue
+
+        gdf = gpd.GeoSeries(lines, crs="EPSG:4326").to_crs("EPSG:3857")
+
+        # 👉 ВАЖНО: буфер = ширина изохрона
+        poly = unary_union(gdf.buffer(200))  # БЫЛО 40 → стало 60
+
+        # немного сглаживания
+        poly = poly.buffer(20).buffer(-15)
+
+        poly = gpd.GeoSeries([poly], crs="EPSG:3857").to_crs("EPSG:4326").iloc[0]
+
+        minutes = t_sec // 60
+
+        if prev_poly is None:
+            ring = poly
+            name = f"0-{minutes} мин"
+        else:
+            ring = poly.difference(prev_poly).buffer(0)
+            name = f"{prev_minutes}-{minutes} мин"
+
+        if not ring.is_empty:
+            zones[name] = ring.__geo_interface__
+
+        prev_poly = poly
+        prev_minutes = minutes
+
+    return zones
+
+========================================

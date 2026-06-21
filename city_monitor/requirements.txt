@@ -1,0 +1,10 @@
+Flask==2.3.3
+flask-cors==4.0.0
+flask-socketio==5.3.4
+eventlet==0.33.3
+osmnx==1.7.0
+networkx==2.8.8
+geopandas==0.14.0
+shapely
+openpyxl==3.1.2
+reportlab==4.0.4

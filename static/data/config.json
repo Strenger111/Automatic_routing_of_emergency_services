@@ -1,0 +1,11 @@
+{
+  "speed_kmh": 50,
+  "time_limits_sec": [
+    300,
+    600,
+    900
+  ],
+  "service_time_sec": 2,
+  "simulation_speed": 52.0,
+   "connection_threshold_meters": 5
+}

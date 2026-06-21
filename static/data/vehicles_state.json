@@ -1,0 +1,67 @@
+{
+  "2": {
+    "id": 2,
+    "current_node": 266614439,
+    "status": "servicing",
+    "inside_station": false,
+    "patrol_center": null,
+    "patrol_radius": null,
+    "patrol_zone_active": false,
+    "assigned_incident_id": 304,
+    "service_start_time": 1780248463.7730505,
+    "total_calls": 10,
+    "avg_response_time": 45994.76287224293
+  },
+  "150": {
+    "id": 150,
+    "current_node": 297152079,
+    "status": "idle",
+    "inside_station": true,
+    "patrol_center": null,
+    "patrol_radius": null,
+    "patrol_zone_active": false,
+    "assigned_incident_id": null,
+    "service_start_time": null,
+    "total_calls": 0,
+    "avg_response_time": 0.0
+  },
+  "149": {
+    "id": 149,
+    "current_node": 1042523263,
+    "status": "idle",
+    "inside_station": true,
+    "patrol_center": null,
+    "patrol_radius": null,
+    "patrol_zone_active": false,
+    "assigned_incident_id": null,
+    "service_start_time": null,
+    "total_calls": 10,
+    "avg_response_time": 19668.433928251266
+  },
+  "1": {
+    "id": 1,
+    "current_node": 1203081038,
+    "status": "idle",
+    "inside_station": true,
+    "patrol_center": null,
+    "patrol_radius": null,
+    "patrol_zone_active": false,
+    "assigned_incident_id": null,
+    "service_start_time": null,
+    "total_calls": 5,
+    "avg_response_time": 10983.123228120803
+  },
+  "151": {
+    "id": 151,
+    "current_node": 363850072,
+    "status": "idle",
+    "inside_station": true,
+    "patrol_center": null,
+    "patrol_radius": null,
+    "patrol_zone_active": false,
+    "assigned_incident_id": null,
+    "service_start_time": null,
+    "total_calls": 4,
+    "avg_response_time": 11068.81441950798
+  }
+}

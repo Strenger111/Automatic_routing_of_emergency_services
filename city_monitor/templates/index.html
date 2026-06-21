@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>САМГТ-ЭС - Мониторинг транспорта</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.heat/0.2.0/leaflet-heat.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .collapsible-panel {
+            position: absolute;
+            background: rgba(255,255,255,0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            z-index: 1000;
+            transition: all 0.3s ease;
+        }
+        .panel-header {
+            padding: 8px 12px;
+            cursor: pointer;
+            background: rgba(52, 73, 94, 0.9);
+            border-radius: 12px 12px 0 0;
+            color: white;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+        .panel-header:hover {
+            background: rgba(44, 62, 80, 0.95);
+        }
+        .panel-content {
+            padding: 10px;
+            max-height: 450px;
+            overflow-y: auto;
+            transition: max-height 0.3s ease;
+            font-size: 12px;
+        }
+        .panel-content.collapsed {
+            max-height: 0;
+            padding: 0 10px;
+            overflow: hidden;
+        }
+        .toggle-icon {
+            font-size: 14px;
+            transition: transform 0.3s;
+        }
+        .toggle-icon.rotated {
+            transform: rotate(180deg);
+        }
+        .draw-btn {
+            background: #27ae60;
+            margin-top: 6px;
+        }
+        .draw-btn.active {
+            background: #e74c3c;
+        }
+        .vehicle-select {
+            width: 100%;
+            padding: 5px;
+            margin: 6px 0;
+            border-radius: 6px;
+            border: 1px solid #ddd;
+            font-size: 11px;
+        }
+        button {
+            font-size: 11px;
+            padding: 5px 8px;
+            margin: 3px 0;
+            cursor: pointer;
+            border: none;
+            border-radius: 6px;
+            background: #3498db;
+            color: white;
+            transition: all 0.2s;
+        }
+        button:hover {
+            opacity: 0.8;
+            transform: translateY(-1px);
+        }
+        .zone-list, .layer-list {
+            max-height: 150px;
+            overflow-y: auto;
+            margin-top: 8px;
+            border-top: 1px solid #ddd;
+            padding-top: 6px;
+        }
+        .zone-item, .layer-item {
+            padding: 4px;
+            margin: 2px 0;
+            background: #f5f5f5;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .zone-item:hover, .layer-item:hover {
+            background: #e0e0e0;
+        }
+        .zone-item .delete-zone, .layer-item .delete-layer {
+            float: right;
+            color: red;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        hr {
+            margin: 8px 0;
+        }
+        select, input {
+            font-size: 11px;
+            padding: 4px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+        .upload-group {
+            margin-bottom: 8px;
+        }
+        .upload-group label {
+            display: block;
+            margin-bottom: 3px;
+            font-weight: bold;
+        }
+        .layer-checkbox {
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <a href="/" class="active">🗺️ Карта</a>
+        <a href="/admin">🔧 Админ-панель</a>
+        <a href="/analytics">📊 Аналитика</a>
+    </div>
+
+    <div id="map" style="height: calc(100vh - 52px);"></div>
+
+    <!-- Левая панель - загрузка данных -->
+    <div id="upload-panel" class="collapsible-panel" style="top:70px; left:20px; width:260px;">
+        <div class="panel-header" onclick="togglePanel('upload-panel-content')">
+            <span>📁 Загрузить данные</span>
+            <span class="toggle-icon" id="upload-panel-icon">▼</span>
+        </div>
+        <div id="upload-panel-content" class="panel-content">
+            <div class="upload-group">
+                <label>🛣️ Дороги (GeoJSON):</label>
+                <input type="file" id="roads-file" accept=".geojson" multiple>
+                <div id="roads-layers" class="layer-list" style="margin-top:5px;">
+                    <strong>Загруженные дороги:</strong>
+                    <div id="roads-list"></div>
+                </div>
+            </div>
+            <div class="upload-group">
+                <label>🏢 Здания (GeoJSON):</label>
+                <input type="file" id="buildings-file" accept=".geojson" multiple>
+                <div id="buildings-layers" class="layer-list" style="margin-top:5px;">
+                    <strong>Загруженные здания:</strong>
+                    <div id="buildings-list"></div>
+                </div>
+            </div>
+            <button id="clear-all-layers" style="background:#e74c3c;">🗑️ Очистить все слои</button>
+        </div>
+    </div>
+
+    <!-- Правая панель -->
+    <div id="legend-panel" class="collapsible-panel" style="top:70px; right:20px; width:260px;">
+        <div class="panel-header" onclick="togglePanel('legend-panel-content')">
+            <span>📖 Управление</span>
+            <span class="toggle-icon" id="legend-panel-icon">▼</span>
+        </div>
+        <div id="legend-panel-content" class="panel-content">
+            <div style="display:flex; gap:8px; margin-bottom:6px; flex-wrap:wrap;">
+                <span>🚗 Машина</span>
+                <span>🔥 Пожар</span>
+                <span>🚑 Скорая</span>
+                <span>👮 Полиция</span>
+            </div>
+
+            <hr>
+            <strong>🌡️ Тепловая карта</strong>
+            <select id="heatmap-type" style="width:100%; margin:3px 0; padding:3px;">
+                <option value="">Выключить</option>
+                <option value="fire">🔥 Пожар</option>
+                <option value="ambulance">🚑 Скорая</option>
+                <option value="police">👮 Полиция</option>
+            </select>
+            <button id="show-heatmap" style="width:100%;">Показать</button>
+
+            <hr>
+            <strong>🚨 Создать ЧП</strong>
+            <select id="incident-type-select" style="width:100%; margin:3px 0; padding:3px;">
+                <option value="fire">🔥 Пожар</option>
+                <option value="ambulance">🚑 Скорая</option>
+                <option value="police">👮 Полиция</option>
+            </select>
+            <button id="new-incident-btn" style="width:100%;">➕ Создать ЧП на карте</button>
+
+            <hr>
+            <strong>🎯 Зона патруля</strong>
+            <select id="patrol-vehicle-select" class="vehicle-select">
+                <option value="">Выберите машину</option>
+            </select>
+            <button id="draw-patrol-zone-btn" class="draw-btn" style="width:100%;">✏️ Рисовать зону</button>
+            <button id="clear-patrol-zone-btn" style="width:100%;">🗑️ Очистить зону</button>
+
+            <div id="saved-zones" class="zone-list">
+                <strong>📌 Зоны патруля:</strong>
+                <div id="zones-list"></div>
+            </div>
+
+            <hr>
+            <button id="show-all-zones" style="width:100%;">📊 Все изохроны</button>
+            <button id="clear-zones" style="width:100%;">🗑️ Очистить изохроны</button>
+            <button id="new-station-btn" style="width:100%;">➕ Новая станция</button>
+        </div>
+    </div>
+
+    <!-- Панель машин -->
+    <div id="vehicles-panel" class="collapsible-panel" style="top:70px; left:290px; width:240px;">
+        <div class="panel-header" onclick="togglePanel('vehicles-panel-content')">
+            <span>🚗 Активные машины</span>
+            <span class="toggle-icon" id="vehicles-panel-icon">▼</span>
+        </div>
+        <div id="vehicles-panel-content" class="panel-content">
+            <div id="vehicles-list"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+    <script>
+        function togglePanel(contentId) {
+            const content = document.getElementById(contentId);
+            const iconId = contentId.replace('-content', '-icon');
+            const icon = document.getElementById(iconId);
+            if (content.classList.contains('collapsed')) {
+                content.classList.remove('collapsed');
+                if (icon) icon.classList.remove('rotated');
+            } else {
+                content.classList.add('collapsed');
+                if (icon) icon.classList.add('rotated');
+            }
+        }
+
+        function updatePatrolVehicleSelect() {
+            const select = document.getElementById('patrol-vehicle-select');
+            if (!select) return;
+            fetch('/api/admin/vehicles')
+                .then(r => r.json())
+                .then(vehicles => {
+                    const currentValue = select.value;
+                    select.innerHTML = '<option value="">Выберите машину</option>';
+                    vehicles.forEach(v => {
+                        const option = document.createElement('option');
+                        option.value = v.id;
+                        const typeSymbol = v.type === 'fire' ? '🔥' : (v.type === 'ambulance' ? '🚑' : '👮');
+                        option.textContent = `${typeSymbol} ${v.name} (${v.status})`;
+                        if (v.has_patrol_zone) option.style.backgroundColor = '#e8f5e9';
+                        select.appendChild(option);
+                    });
+                    if (currentValue && vehicles.find(v => v.id == currentValue)) {
+                        select.value = currentValue;
+                    }
+                });
+        }
+
+        setInterval(updatePatrolVehicleSelect, 5000);
+        updatePatrolVehicleSelect();
+
+        async function loadSavedZones() {
+            const zonesList = document.getElementById('zones-list');
+            if (!zonesList) return;
+            const vehicles = await fetch('/api/admin/vehicles').then(r => r.json());
+            const vehiclesWithZones = vehicles.filter(v => v.has_patrol_zone);
+            if (vehiclesWithZones.length === 0) {
+                zonesList.innerHTML = '<i>Нет сохранённых зон</i>';
+                return;
+            }
+            zonesList.innerHTML = vehiclesWithZones.map(v => `
+                <div class="zone-item" data-vehicle-id="${v.id}">
+                    ${v.type === 'fire' ? '🔥' : (v.type === 'ambulance' ? '🚑' : '👮')} Машина ${v.id}
+                    <span class="delete-zone" onclick="event.stopPropagation(); deleteZone(${v.id})">✖</span>
+                </div>
+            `).join('');
+            document.querySelectorAll('.zone-item').forEach(el => {
+                el.addEventListener('click', () => showZoneOnMap(el.dataset.vehicleId));
+            });
+        }
+
+        async function showZoneOnMap(vehicleId) {
+            const res = await fetch(`/api/vehicle/${vehicleId}/patrol_zone`);
+            if (res.ok) {
+                const data = await res.json();
+                if (data.type === 'Polygon' && window.showPatrolZoneOnMap) {
+                    window.showPatrolZoneOnMap(data.coordinates[0].map(c => [c[1], c[0]]));
+                }
+            }
+        }
+
+        async function deleteZone(vehicleId) {
+            if (confirm('Удалить зону патрулирования?')) {
+                await fetch(`/api/vehicle/${vehicleId}/patrol_zone/clear`, { method: 'POST' });
+                loadSavedZones();
+                if (window.currentPatrolZoneLayer) {
+                    window.map.removeLayer(window.currentPatrolZoneLayer);
+                    window.currentPatrolZoneLayer = null;
+                }
+            }
+        }
+
+        setInterval(loadSavedZones, 10000);
+        loadSavedZones();
+    </script>
+</body>
+</html>
