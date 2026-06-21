@@ -1,0 +1,10 @@
+.env
+.idea/
+__pycache__/
+venv/
+.pytest_cache/
+database.py
+project_dump.txt
+export_project.py
+*.pyc
+*.iml
